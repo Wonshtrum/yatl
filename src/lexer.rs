@@ -1,20 +1,85 @@
+use std::fmt::Debug;
+
+#[derive(Debug)]
+pub enum Error {
+    Unexpected(Span),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub row: usize,
+    pub col: usize,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Spanned<T: Debug + Clone> {
+    pub data: T,
+    pub span: Span,
+}
+
+impl<T: Debug + Clone> std::ops::Deref for Spanned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
     Else,
 
     // Literals
+    True,
+    False,
     Integer(u64),
     Identifier(String),
 
     // Symbols
     Arrow,
     FatArrow,
+    Dot,
     Comma,
     Colon,
     DoubleColon,
     Semicolon,
     Underscore,
+    Exclamation,
+    Interogation,
+
+    // Logic operators
+    And,
+    Or,
+
+    // Arithmetic operators
+    Plus,
+    Minus,
+    Times,
+    Divide,
+    Modulo,
+
+    // Bitwise operators
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
+
+    // Comparison operators
+    EQ,
+    NE,
+    LT,
+    GT,
+    LTE,
+    GTE,
 
     // Delimiters
     LParen,
@@ -28,16 +93,199 @@ pub enum Token {
     Eof,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenKind {
+    // Keywords
+    Else,
+
+    // Literals
+    True,
+    False,
+    Integer,
+    Identifier,
+
+    // Symbols
+    Arrow,
+    FatArrow,
+    Dot,
+    Comma,
+    Colon,
+    DoubleColon,
+    Semicolon,
+    Underscore,
+    Exclamation,
+    Interogation,
+
+    // Logic operators
+    And,
+    Or,
+
+    // Arithmetic operators
+    Plus,
+    Minus,
+    Times,
+    Divide,
+    Modulo,
+
+    // Bitwise operators
+    BitAnd,
+    BitOr,
+    BitXor,
+    LShift,
+    RShift,
+
+    // Comparison operators
+    EQ,
+    NE,
+    LT,
+    GT,
+    LTE,
+    GTE,
+
+    // Delimiters
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
+
+    // End of input
+    Eof,
+}
+
+impl Token {
+    pub fn kind(&self) -> TokenKind {
+        match self {
+            // Keywords
+            Self::Else => TokenKind::Else,
+
+            // Literals
+            Self::True => TokenKind::True,
+            Self::False => TokenKind::False,
+            Self::Integer(_) => TokenKind::Integer,
+            Self::Identifier(_) => TokenKind::Identifier,
+
+            // Symbols
+            Self::Arrow => TokenKind::Arrow,
+            Self::FatArrow => TokenKind::FatArrow,
+            Self::Dot => TokenKind::Dot,
+            Self::Comma => TokenKind::Comma,
+            Self::Colon => TokenKind::Colon,
+            Self::DoubleColon => TokenKind::DoubleColon,
+            Self::Semicolon => TokenKind::Semicolon,
+            Self::Underscore => TokenKind::Underscore,
+            Self::Exclamation => TokenKind::Exclamation,
+            Self::Interogation => TokenKind::Interogation,
+
+            // Logic operators
+            Self::And => TokenKind::And,
+            Self::Or => TokenKind::Or,
+
+            // Arithmetic operators
+            Self::Plus => TokenKind::Plus,
+            Self::Minus => TokenKind::Minus,
+            Self::Times => TokenKind::Times,
+            Self::Divide => TokenKind::Divide,
+            Self::Modulo => TokenKind::Modulo,
+
+            // Bitwise operators
+            Self::BitAnd => TokenKind::BitAnd,
+            Self::BitOr => TokenKind::BitOr,
+            Self::BitXor => TokenKind::BitXor,
+            Self::LShift => TokenKind::LShift,
+            Self::RShift => TokenKind::RShift,
+
+            // Comparison operators
+            Self::EQ => TokenKind::EQ,
+            Self::NE => TokenKind::NE,
+            Self::LT => TokenKind::LT,
+            Self::GT => TokenKind::GT,
+            Self::LTE => TokenKind::LTE,
+            Self::GTE => TokenKind::GTE,
+
+            // Delimiters
+            Self::LParen => TokenKind::LParen,
+            Self::RParen => TokenKind::RParen,
+            Self::LBracket => TokenKind::LBracket,
+            Self::RBracket => TokenKind::RBracket,
+            Self::LBrace => TokenKind::LBrace,
+            Self::RBrace => TokenKind::RBrace,
+
+            // End of input
+            Self::Eof => TokenKind::Eof,
+        }
+    }
+}
+
 pub struct Lexer {
-    input: Vec<char>,
-    pos: usize,
+    pub file: String,
+    pub input: Vec<char>,
+    pub pos: usize,
+    pub nl_map: Vec<usize>,
 }
 
 impl Lexer {
-    pub fn new(input: &str) -> Self {
+    pub fn new(file: String, input: &str) -> Self {
         Lexer {
             input: input.chars().collect(),
             pos: 0,
+            file,
+            nl_map: Vec::new(),
+        }
+    }
+
+    pub fn index_to_position(&self, index: usize) -> Position {
+        let mut line_start = 0;
+        let mut line_end = 0;
+        let mut row = 1;
+        for pos in &self.nl_map {
+            line_end = *pos;
+            row += 1;
+            if index < *pos {
+                break;
+            }
+            line_start = *pos;
+        }
+        if line_end < index {
+            while line_end < self.input.len() && self.input[line_end] != '\n' {
+                line_end += 1;
+            }
+        }
+        Position {
+            row,
+            col: index - line_start,
+            line_start,
+            line_end,
+        }
+    }
+
+    pub fn substring(&self, start: usize, end: usize) -> String {
+        self.input[start..end].iter().cloned().collect::<String>()
+    }
+
+    pub fn print_span(&self, span: Span) {
+        let pos = self.index_to_position(span.start);
+        println!("   --> {}:{}:{}", self.file, pos.row, pos.col);
+        println!("    |");
+        println!(
+            "{: <3} | {}",
+            pos.row,
+            self.substring(pos.line_start, pos.line_end - 1)
+        );
+        println!(
+            "    | {: >col$}{:^>len$}",
+            "",
+            "",
+            col = pos.col,
+            len = span.end - span.start
+        );
+    }
+
+    fn span(&self, start: usize) -> Span {
+        Span {
+            start,
+            end: self.pos,
         }
     }
 
@@ -58,7 +306,11 @@ impl Lexer {
         }
     }
 
+    #[inline]
     fn advance(&mut self) {
+        if self.input[self.pos] == '\n' {
+            self.nl_map.push(self.pos + 1);
+        }
         self.pos += 1;
     }
 
@@ -100,10 +352,11 @@ impl Lexer {
         result
     }
 
-    pub fn next_token(&mut self) -> Token {
+    pub fn next_token(&mut self) -> Result<Spanned<Token>, Error> {
         self.skip_whitespace();
 
-        match self.current() {
+        let start = self.pos;
+        let data = match self.current() {
             None => Token::Eof,
             Some('-') if self.peek(1) == Some('>') => {
                 self.advance();
@@ -169,21 +422,40 @@ impl Lexer {
                 Token::Integer(num)
             }
             Some(c) => {
-                panic!("Unexpected character: {c}");
+                return Err(Error::Unexpected(Span {
+                    start,
+                    end: start + 1,
+                }));
             }
-        }
+        };
+        Ok(Spanned {
+            data,
+            span: self.span(start),
+        })
     }
 
-    pub fn tokenize(&mut self) -> Vec<Token> {
+    pub fn tokenize(&mut self) -> Result<Vec<Spanned<Token>>, Error> {
         let mut tokens = Vec::new();
         loop {
-            let token = self.next_token();
-            if token == Token::Eof {
+            let token = self.next_token()?;
+            if token.kind() == TokenKind::Eof {
                 tokens.push(token);
                 break;
             }
             tokens.push(token);
         }
-        tokens
+        Ok(tokens)
+    }
+
+    pub fn pretty_print(&self, error: &Error) {
+        match error {
+            Error::Unexpected(span) => {
+                println!(
+                    "error: Unexpected character `{}`",
+                    self.substring(span.start, span.end)
+                );
+                self.print_span(*span);
+            }
+        }
     }
 }
