@@ -1,9 +1,10 @@
 mod ast;
 mod lexer;
 mod parser;
+mod source;
 
 fn main() {
-    let mut lexer = lexer::Lexer::new(
+    let source = source::Source::new(
         "src/test".into(),
         "
         1 -> { Option::Some([x,y,2,]) => {1} Option::None => {2;} } else {};
@@ -12,21 +13,18 @@ fn main() {
             { T::A { x, } => {}, T::B { x: 2, y: x } => {}, },
             { T::C ( x, ) },
         };
-        get::a::b(1 -> x);
+        get::a::b(1 -> x) => { true } else { false };
         map(Option::Some);
         Point { x: 1, y: 2, } -> p;
+        false
     ",
     );
-    let tokens = lexer.tokenize();
-    println!("{tokens:#?}");
-    if let Err(error) = &tokens {
-        lexer.pretty_print(error);
-    }
-    let mut parser = parser::Parser::from_tokens(lexer, tokens.unwrap());
-
-    let exprs = parser.parse();
-    println!("{exprs:#?}");
-    if let Err(error) = &exprs {
-        parser.pretty_print(error);
-    }
+    let mut parser = match parser::Parser::try_new(&source) {
+        Err(error) => return error.pretty_print(&source),
+        Ok(parser) => parser,
+    };
+    let exprs = match parser.parse() {
+        Err(error) => return error.pretty_print(&source),
+        Ok(exprs) => println!("{exprs:#?}"),
+    };
 }

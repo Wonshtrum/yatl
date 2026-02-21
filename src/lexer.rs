@@ -1,34 +1,21 @@
-use std::fmt::Debug;
+use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
     Unexpected(Span),
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct Position {
-    pub row: usize,
-    pub col: usize,
-    pub line_start: usize,
-    pub line_end: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct Spanned<T: Debug + Clone> {
-    pub data: T,
-    pub span: Span,
-}
-
-impl<T: Debug + Clone> std::ops::Deref for Spanned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.data
+impl Error {
+    pub fn pretty_print(&self, source: &Source) {
+        match self {
+            Self::Unexpected(span) => {
+                println!(
+                    "error: Unexpected character `{}`",
+                    source.substring(span.start, span.end)
+                );
+                source.print_span(*span);
+            }
+        }
     }
 }
 
@@ -218,68 +205,14 @@ impl Token {
     }
 }
 
-pub struct Lexer {
-    pub file: String,
-    pub input: Vec<char>,
+pub struct Lexer<'a> {
+    pub source: &'a Source,
     pub pos: usize,
-    pub nl_map: Vec<usize>,
 }
 
-impl Lexer {
-    pub fn new(file: String, input: &str) -> Self {
-        Lexer {
-            input: input.chars().collect(),
-            pos: 0,
-            file,
-            nl_map: Vec::new(),
-        }
-    }
-
-    pub fn index_to_position(&self, index: usize) -> Position {
-        let mut line_start = 0;
-        let mut line_end = 0;
-        let mut row = 1;
-        for pos in &self.nl_map {
-            line_end = *pos;
-            row += 1;
-            if index < *pos {
-                break;
-            }
-            line_start = *pos;
-        }
-        if line_end < index {
-            while line_end < self.input.len() && self.input[line_end] != '\n' {
-                line_end += 1;
-            }
-        }
-        Position {
-            row,
-            col: index - line_start,
-            line_start,
-            line_end,
-        }
-    }
-
-    pub fn substring(&self, start: usize, end: usize) -> String {
-        self.input[start..end].iter().cloned().collect::<String>()
-    }
-
-    pub fn print_span(&self, span: Span) {
-        let pos = self.index_to_position(span.start);
-        println!("   --> {}:{}:{}", self.file, pos.row, pos.col);
-        println!("    |");
-        println!(
-            "{: <3} | {}",
-            pos.row,
-            self.substring(pos.line_start, pos.line_end - 1)
-        );
-        println!(
-            "    | {: >col$}{:^>len$}",
-            "",
-            "",
-            col = pos.col,
-            len = span.end - span.start
-        );
+impl<'a> Lexer<'a> {
+    pub fn new(source: &'a Source) -> Lexer<'a> {
+        Lexer { source, pos: 0 }
     }
 
     fn span(&self, start: usize) -> Span {
@@ -290,8 +223,8 @@ impl Lexer {
     }
 
     fn current(&self) -> Option<char> {
-        if self.pos < self.input.len() {
-            Some(self.input[self.pos])
+        if self.pos < self.source.len() {
+            Some(self.source[self.pos])
         } else {
             None
         }
@@ -299,8 +232,8 @@ impl Lexer {
 
     fn peek(&self, offset: usize) -> Option<char> {
         let pos = self.pos + offset;
-        if pos < self.input.len() {
-            Some(self.input[pos])
+        if pos < self.source.len() {
+            Some(self.source[pos])
         } else {
             None
         }
@@ -308,9 +241,6 @@ impl Lexer {
 
     #[inline]
     fn advance(&mut self) {
-        if self.input[self.pos] == '\n' {
-            self.nl_map.push(self.pos + 1);
-        }
         self.pos += 1;
     }
 
@@ -358,10 +288,29 @@ impl Lexer {
         let start = self.pos;
         let data = match self.current() {
             None => Token::Eof,
-            Some('-') if self.peek(1) == Some('>') => {
+            Some('/') => {
                 self.advance();
+                if self.current() == Some('/') {
+                    // skip comment
+                    self.advance();
+                    while let Some(c) = self.current() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    return self.next_token();
+                }
+                Token::Divide
+            }
+            Some('-') => {
                 self.advance();
-                Token::Arrow
+                if self.current() == Some('>') {
+                    self.advance();
+                    Token::Arrow
+                } else {
+                    Token::Minus
+                }
             }
             Some('=') if self.peek(1) == Some('>') => {
                 self.advance();
@@ -414,6 +363,8 @@ impl Lexer {
                 match ident.as_str() {
                     "_" => Token::Underscore,
                     "else" => Token::Else,
+                    "true" => Token::True,
+                    "false" => Token::False,
                     _ => Token::Identifier(ident),
                 }
             }
@@ -445,17 +396,5 @@ impl Lexer {
             tokens.push(token);
         }
         Ok(tokens)
-    }
-
-    pub fn pretty_print(&self, error: &Error) {
-        match error {
-            Error::Unexpected(span) => {
-                println!(
-                    "error: Unexpected character `{}`",
-                    self.substring(span.start, span.end)
-                );
-                self.print_span(*span);
-            }
-        }
     }
 }

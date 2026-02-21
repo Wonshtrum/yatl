@@ -1,3 +1,5 @@
+use crate::source::Spanned;
+
 #[derive(Debug, Clone)]
 pub struct Path {
     pub name: String,
@@ -6,76 +8,84 @@ pub struct Path {
 
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub exprs: Vec<Expr>,
+    pub exprs: Vec<Spanned<Expr>>,
+    pub value: Option<Box<Spanned<Expr>>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum NamedExpr {
     Implicit(String),
-    Explicit { name: String, expr: Expr },
+    Explicit { name: String, expr: Spanned<Expr> },
 }
 
 #[derive(Debug, Clone)]
 pub enum Expr {
     // Literals
-    Unit,
+    True,
+    False,
     Integer(u64),
     Identifier(String),
     Path(Path),
 
     // [ expr, expr, ... ]
     Array {
-        args: Vec<Expr>,
+        args: Vec<Spanned<Expr>>,
     },
     // ( expr, expr, ... )
     Tuple {
-        args: Vec<Expr>,
+        args: Vec<Spanned<Expr>>,
     },
     // name( expr, expr, ... )
     Constructor {
-        name: Path,
-        args: Vec<Expr>,
+        name: Spanned<Path>,
+        args: Vec<Spanned<Expr>>,
     },
     // name { name: expr, name: expr, ... }
     NamedConstructor {
-        name: Path,
-        args: Vec<NamedExpr>,
+        name: Spanned<Path>,
+        args: Vec<Spanned<NamedExpr>>,
     },
 
     // expr -> pattern
     Binding {
-        expr: Box<Expr>,
-        pattern: Pattern,
+        expr: Box<Spanned<Expr>>,
+        pattern: Spanned<Pattern>,
     },
 
     // expr => { expr... }
     ThenFlow {
-        condition: Box<Expr>,
-        then_block: Block,
+        condition: Box<Spanned<Expr>>,
+        then_block: Spanned<Block>,
     },
 
     // expr else { expr... }
     ElseFlow {
-        condition: Box<Expr>,
-        else_block: Block,
+        condition: Box<Spanned<Expr>>,
+        else_block: Spanned<Block>,
     },
 
     // expr => { expr... } else { expr... }
     ThenElseFlow {
-        condition: Box<Expr>,
-        then_block: Block,
-        else_block: Block,
+        condition: Box<Spanned<Expr>>,
+        then_block: Spanned<Block>,
+        else_block: Spanned<Block>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub enum NamedPattern {
     Implicit(String),
-    Explicit { name: String, pattern: Pattern },
+    Explicit {
+        name: String,
+        pattern: Spanned<Pattern>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
+    // Literals
+    True,
+    False,
     Wildcard,
     Integer(u64),
     Identifier(String),
@@ -83,29 +93,29 @@ pub enum Pattern {
 
     // [ pat, pat, ... ]
     Array {
-        patterns: Vec<Pattern>,
+        patterns: Vec<Spanned<Pattern>>,
     },
     // ( pat, pat, ... )
     Tuple {
-        patterns: Vec<Pattern>,
+        patterns: Vec<Spanned<Pattern>>,
     },
     // name( pat, pat, ... )
     Constructor {
-        name: Path,
-        patterns: Vec<Pattern>,
+        name: Spanned<Path>,
+        patterns: Vec<Spanned<Pattern>>,
     },
     // name { name: pat, name: pat, ... }
     NamedConstructor {
-        name: Path,
-        patterns: Vec<NamedPattern>,
+        name: Spanned<Path>,
+        patterns: Vec<Spanned<NamedPattern>>,
     },
 
     // { pat, pat, ... }
     Alternatives {
-        patterns: Vec<Pattern>,
+        patterns: Vec<Spanned<Pattern>>,
     },
     // { pat => { expr... }, pat => { expr... }, ... }
     MatchArms {
-        arms: Vec<(Pattern, Block)>,
+        arms: Vec<(Spanned<Pattern>, Spanned<Block>)>,
     },
 }

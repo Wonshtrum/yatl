@@ -1,5 +1,6 @@
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
-use crate::lexer::{Lexer, Spanned, Token, TokenKind};
+use crate::lexer::{Lexer, Token, TokenKind};
+use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
@@ -8,27 +9,63 @@ pub enum Error {
         message: Option<&'static str>,
         expected: Vec<TokenKind>,
         found: Spanned<Token>,
+        started: Option<Span>,
     },
 }
 
-pub struct Parser {
-    pub lexer: Lexer,
+impl Error {
+    pub fn pretty_print(&self, source: &Source) {
+        match self {
+            Self::Lexer(error) => error.pretty_print(source),
+            Self::Unexpected {
+                message,
+                expected,
+                found,
+                started,
+            } => {
+                print!("error: ");
+                if let Some(message) = message {
+                    print!("Expected {message}");
+                    if expected.len() == 1 {
+                        print!(" (token `{:?}`)", expected[0]);
+                    } else if expected.len() > 1 {
+                        print!(" (tokens {:?})", expected);
+                    }
+                    print!(", but found");
+                } else if expected.len() == 1 {
+                    print!("Expected token `{:?}`, but found", expected[0]);
+                } else {
+                    print!("Unexpected");
+                }
+                println!(" token `{:?}`", found.data);
+                source.print_span(found.span);
+                if let Some(started) = started {
+                    println!("note: Started by");
+                    source.print_span(*started);
+                }
+            }
+        }
+    }
+}
+
+pub struct Parser<'a> {
+    pub source: &'a Source,
     pub tokens: Vec<Spanned<Token>>,
     pub pos: usize,
     eof: Spanned<Token>,
 }
 
-impl Parser {
-    pub fn new(file: String, input: &str) -> Result<Self, Error> {
-        let mut lexer = Lexer::new(file, input);
+impl<'a> Parser<'a> {
+    pub fn try_new(source: &'a Source) -> Result<Parser<'a>, Error> {
+        let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize().map_err(Error::Lexer)?;
-        Ok(Self::from_tokens(lexer, tokens))
+        Ok(Self::new(source, tokens))
     }
 
-    pub fn from_tokens(lexer: Lexer, tokens: Vec<Spanned<Token>>) -> Self {
+    pub fn new(source: &'a Source, tokens: Vec<Spanned<Token>>) -> Parser<'a> {
         let eof = tokens.last().unwrap().clone();
         Parser {
-            lexer,
+            source,
             tokens,
             pos: 0,
             eof,
@@ -58,112 +95,148 @@ impl Parser {
         }
     }
 
-    fn expect(&mut self, expected: TokenKind, message: Option<&'static str>) -> Result<(), Error> {
+    fn expect(
+        &mut self,
+        expected: TokenKind,
+        message: Option<&'static str>,
+        started: Option<Span>,
+    ) -> Result<Span, Error> {
         if self.current().kind() != expected {
             return Err(Error::Unexpected {
                 message,
                 expected: vec![expected],
                 found: self.current().clone(),
+                started,
             });
-            //panic!("Expected {:?}, found {:?}", expected, self.current());
         }
+        let span = self.current().span;
         self.advance();
-        Ok(())
+        Ok(span)
     }
 
-    pub fn parse(&mut self) -> Result<Vec<Expr>, Error> {
+    pub fn parse(&mut self) -> Result<Vec<Spanned<Expr>>, Error> {
         let mut exprs = Vec::new();
         while self.current().kind() != TokenKind::Eof {
             let expr = self.parse_expr()?;
             exprs.push(expr);
             if self.current().kind() == TokenKind::Semicolon {
                 self.advance();
-            } else {
-                break;
+            } else if self.current().kind() != TokenKind::Eof {
+                return Err(Error::Unexpected {
+                    expected: Vec::new(),
+                    message: Some("end of expression or file"),
+                    found: self.current().clone(),
+                    started: None,
+                });
             }
         }
-        self.expect(TokenKind::Eof, None)?;
+        self.expect(TokenKind::Eof, None, None)?;
         Ok(exprs)
     }
 
-    fn parse_expr(&mut self) -> Result<Expr, Error> {
+    fn parse_expr(&mut self) -> Result<Spanned<Expr>, Error> {
         let mut expr = self.parse_primary()?;
+        let span = expr.span;
         loop {
             expr = match self.current().kind() {
                 TokenKind::Arrow => {
                     self.advance();
                     let pattern = self.parse_pattern()?;
-                    Expr::Binding {
+                    span.merge(pattern.span).attach(Expr::Binding {
                         expr: Box::new(expr),
                         pattern,
-                    }
+                    })
                 }
                 TokenKind::FatArrow => {
                     self.advance();
                     let then_block = self.parse_block()?;
                     if self.current().kind() == TokenKind::Else {
+                        self.advance();
                         let else_block = self.parse_block()?;
-                        Expr::ThenElseFlow {
+                        span.merge(else_block.span).attach(Expr::ThenElseFlow {
                             condition: Box::new(expr),
                             then_block,
                             else_block,
-                        }
+                        })
                     } else {
-                        Expr::ThenFlow {
+                        span.merge(then_block.span).attach(Expr::ThenFlow {
                             condition: Box::new(expr),
                             then_block,
-                        }
+                        })
                     }
                 }
                 TokenKind::Else => {
                     self.advance();
                     let else_block = self.parse_block()?;
-                    Expr::ElseFlow {
+                    span.merge(else_block.span).attach(Expr::ElseFlow {
                         condition: Box::new(expr),
                         else_block,
-                    }
+                    })
                 }
                 _ => return Ok(expr),
             }
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, Error> {
+    fn parse_primary(&mut self) -> Result<Spanned<Expr>, Error> {
+        let span = self.current().span;
         let expr = match &self.current().data {
+            Token::True => {
+                self.advance();
+                span.attach(Expr::True)
+            }
+            Token::False => {
+                self.advance();
+                span.attach(Expr::False)
+            }
             Token::Integer(n) => {
                 let n = *n;
                 self.advance();
-                Expr::Integer(n)
+                span.attach(Expr::Integer(n))
             }
             Token::LParen => {
                 self.advance();
                 let args = self.parse_expr_list(TokenKind::RParen)?;
-                Expr::Tuple { args }
+                let last_span = self.expect(TokenKind::RParen, Some("end of tuple"), Some(span))?;
+                span.merge(last_span).attach(Expr::Tuple { args })
             }
             Token::LBracket => {
                 self.advance();
                 let args = self.parse_expr_list(TokenKind::RBracket)?;
-                Expr::Array { args }
+                let last_span =
+                    self.expect(TokenKind::RBracket, Some("end of array"), Some(span))?;
+                span.merge(last_span).attach(Expr::Array { args })
             }
             Token::Identifier(_) => {
                 let path = self.parse_path()?;
+                let started = Some(self.current().span);
                 match self.current().kind() {
                     TokenKind::LParen => {
                         self.advance();
                         let args = self.parse_expr_list(TokenKind::RParen)?;
-                        Expr::Constructor { name: path, args }
+                        let last_span =
+                            self.expect(TokenKind::RParen, Some("end of constructor"), started)?;
+                        span.merge(last_span)
+                            .attach(Expr::Constructor { name: path, args })
                     }
                     TokenKind::LBrace => {
                         self.advance();
                         let args = self.parse_named_expr_list(TokenKind::RBrace)?;
-                        Expr::NamedConstructor { name: path, args }
+                        let last_span = self.expect(
+                            TokenKind::RBrace,
+                            Some("end of named constructor"),
+                            started,
+                        )?;
+                        span.merge(last_span)
+                            .attach(Expr::NamedConstructor { name: path, args })
                     }
                     _ => {
-                        if path.parents.is_empty() {
-                            Expr::Identifier(path.name)
+                        let expr = if path.parents.is_empty() {
+                            Expr::Identifier(path.data.name)
                         } else {
-                            Expr::Path(path)
-                        }
+                            Expr::Path(path.data)
+                        };
+                        path.span.attach(expr)
                     }
                 }
             }
@@ -172,22 +245,25 @@ impl Parser {
                     expected: Vec::new(),
                     message: Some("primary expression"),
                     found: self.current().clone(),
+                    started: None,
                 });
-            } // _ => panic!("Expected expression, found: {:?}", self.current()),
+            }
         };
         Ok(expr)
     }
 
-    fn parse_path(&mut self) -> Result<Path, Error> {
+    fn parse_path(&mut self) -> Result<Spanned<Path>, Error> {
         let Token::Identifier(name) = &self.current().data else {
-            // panic!("Expected path, found: {:?}", self.current());
             return Err(Error::Unexpected {
                 expected: Vec::new(),
                 message: Some("path"),
                 found: self.current().clone(),
+                started: None,
             });
         };
+        let span = self.current().span;
         let mut last = name.clone();
+        let mut last_span = span;
         self.advance();
         let mut parents = Vec::new();
         while self.current().kind() == TokenKind::DoubleColon {
@@ -198,133 +274,167 @@ impl Parser {
                     expected: vec![TokenKind::Identifier],
                     message: Some("path segment"),
                     found: self.current().clone(),
+                    started: None,
                 });
-                // panic!("Expected path element, found: {:?}", self.current());
             };
             last = name.clone();
+            last_span = self.current().span;
             self.advance();
         }
-        Ok(Path {
+        Ok(span.merge(last_span).attach(Path {
             name: last,
             parents,
-        })
+        }))
     }
 
-    fn parse_expr_list(&mut self, terminator: TokenKind) -> Result<Vec<Expr>, Error> {
-        let mut args = Vec::new();
+    fn parse_expr_list(&mut self, terminator: TokenKind) -> Result<Vec<Spanned<Expr>>, Error> {
+        let mut exprs = Vec::new();
         while self.current().kind() != terminator {
-            let arg = self.parse_expr()?;
-            args.push(arg);
+            let expr = self.parse_expr()?;
+            exprs.push(expr);
             if self.current().kind() == TokenKind::Comma {
                 self.advance();
             } else {
                 break;
             }
         }
-        self.expect(terminator, Some("end of expression list"))?;
-        Ok(args)
+        Ok(exprs)
     }
 
-    fn parse_named_expr_list(&mut self, terminator: TokenKind) -> Result<Vec<NamedExpr>, Error> {
-        let mut args = Vec::new();
+    fn parse_named_expr_list(
+        &mut self,
+        terminator: TokenKind,
+    ) -> Result<Vec<Spanned<NamedExpr>>, Error> {
+        let mut exprs = Vec::new();
         while self.current().kind() != terminator {
             let Token::Identifier(name) = &self.current().data else {
                 return Err(Error::Unexpected {
                     expected: vec![TokenKind::Identifier],
                     message: Some("name"),
                     found: self.current().clone(),
+                    started: None,
                 });
-                // panic!("Expected name, found: {:?}", self.current());
             };
             let name = name.clone();
+            let span = self.current().span;
             self.advance();
-            let arg = if self.current().kind() == TokenKind::Colon {
+            let expr = if self.current().kind() == TokenKind::Colon {
                 self.advance();
                 let expr = self.parse_expr()?;
-                NamedExpr::Explicit { name, expr }
+                span.merge(expr.span)
+                    .attach(NamedExpr::Explicit { name, expr })
             } else {
-                NamedExpr::Implicit(name)
+                span.attach(NamedExpr::Implicit(name))
             };
-            args.push(arg);
+            exprs.push(expr);
             if self.current().kind() == TokenKind::Comma {
                 self.advance();
             } else {
                 break;
             }
         }
-        self.expect(terminator, Some("end of named expression list"))?;
-        Ok(args)
+        Ok(exprs)
     }
 
-    fn parse_block(&mut self) -> Result<Block, Error> {
-        self.expect(TokenKind::LBrace, Some("start of block"))?;
+    fn parse_block(&mut self) -> Result<Spanned<Block>, Error> {
+        let span = self.expect(TokenKind::LBrace, Some("start of block"), None)?;
         let mut exprs = Vec::new();
+        let mut value = None;
         while self.current().kind() != TokenKind::RBrace {
             let expr = self.parse_expr()?;
-            exprs.push(expr);
             if self.current().kind() == TokenKind::Semicolon {
                 self.advance();
-                if self.current().kind() == TokenKind::RBrace {
-                    exprs.push(Expr::Unit);
-                }
+                exprs.push(expr);
             } else {
+                value = Some(Box::new(expr));
                 break;
             }
         }
-        self.expect(TokenKind::RBrace, Some("end of block"))?;
-        Ok(Block { exprs })
+        let last_span = self.expect(TokenKind::RBrace, Some("end of block"), Some(span))?;
+        Ok(span.merge(last_span).attach(Block { exprs, value }))
     }
 
-    fn parse_pattern(&mut self) -> Result<Pattern, Error> {
+    fn parse_pattern(&mut self) -> Result<Spanned<Pattern>, Error> {
+        let span = self.current().span;
         let pattern = match &self.current().data {
             Token::Underscore => {
                 self.advance();
-                Pattern::Wildcard
+                span.attach(Pattern::Wildcard)
+            }
+            Token::True => {
+                self.advance();
+                span.attach(Pattern::True)
+            }
+            Token::False => {
+                self.advance();
+                span.attach(Pattern::False)
             }
             Token::Integer(n) => {
                 let n = *n;
                 self.advance();
-                Pattern::Integer(n)
+                span.attach(Pattern::Integer(n))
             }
             Token::LParen => {
                 self.advance();
                 let patterns = self.parse_pattern_list(TokenKind::RParen)?;
-                Pattern::Tuple { patterns }
+                let last_span =
+                    self.expect(TokenKind::RParen, Some("end of tuple pattern"), Some(span))?;
+                span.merge(last_span).attach(Pattern::Tuple { patterns })
             }
             Token::LBracket => {
                 self.advance();
                 let patterns = self.parse_pattern_list(TokenKind::RBracket)?;
-                Pattern::Array { patterns }
+                let last_span = self.expect(
+                    TokenKind::RBracket,
+                    Some("end of array pattern"),
+                    Some(span),
+                )?;
+                span.merge(last_span).attach(Pattern::Array { patterns })
             }
             Token::LBrace => {
                 self.advance();
-                self.parse_pattern_group()?
+                let pattern = self.parse_pattern_group()?;
+                let last_span =
+                    self.expect(TokenKind::RBrace, Some("end of pattern group"), Some(span))?;
+                span.merge(last_span).attach(pattern)
             }
             Token::Identifier(_) => {
                 let path = self.parse_path()?;
+                let started = Some(self.current().span);
                 match self.current().kind() {
                     TokenKind::LParen => {
                         self.advance();
                         let patterns = self.parse_pattern_list(TokenKind::RParen)?;
-                        Pattern::Constructor {
+                        let last_span = self.expect(
+                            TokenKind::RParen,
+                            Some("end of constructor pattern"),
+                            started,
+                        )?;
+                        span.merge(last_span).attach(Pattern::Constructor {
                             name: path,
                             patterns,
-                        }
+                        })
                     }
                     TokenKind::LBrace => {
                         self.advance();
                         let patterns = self.parse_named_pattern_list(TokenKind::RBrace)?;
-                        Pattern::NamedConstructor {
+                        let last_span = self.expect(
+                            TokenKind::RBrace,
+                            Some("end of named constructor pattern"),
+                            started,
+                        )?;
+                        span.merge(last_span).attach(Pattern::NamedConstructor {
                             name: path,
                             patterns,
-                        }
+                        })
                     }
                     _ => {
-                        if path.parents.is_empty() {
-                            Pattern::Identifier(path.name)
+                        let pattern = if path.parents.is_empty() {
+                            Pattern::Identifier(path.data.name)
                         } else {
-                            Pattern::Path(path)
-                        }
+                            Pattern::Path(path.data)
+                        };
+                        path.span.attach(pattern)
                     }
                 }
             }
@@ -333,13 +443,17 @@ impl Parser {
                     expected: Vec::new(),
                     message: Some("pattern"),
                     found: self.current().clone(),
+                    started: None,
                 });
-            } // _ => panic!("Expected pattern, found: {:?}", self.current()),
+            }
         };
         Ok(pattern)
     }
 
-    fn parse_pattern_list(&mut self, terminator: TokenKind) -> Result<Vec<Pattern>, Error> {
+    fn parse_pattern_list(
+        &mut self,
+        terminator: TokenKind,
+    ) -> Result<Vec<Spanned<Pattern>>, Error> {
         let mut patterns = Vec::new();
         while self.current().kind() != terminator {
             let pattern = self.parse_pattern()?;
@@ -350,14 +464,13 @@ impl Parser {
                 break;
             }
         }
-        self.expect(terminator, Some("end of pattern list"))?;
         Ok(patterns)
     }
 
     fn parse_named_pattern_list(
         &mut self,
         terminator: TokenKind,
-    ) -> Result<Vec<NamedPattern>, Error> {
+    ) -> Result<Vec<Spanned<NamedPattern>>, Error> {
         let mut patterns = Vec::new();
         while self.current().kind() != terminator {
             let Token::Identifier(name) = &self.current().data else {
@@ -365,17 +478,19 @@ impl Parser {
                     expected: vec![TokenKind::Identifier],
                     message: Some("pattern name"),
                     found: self.current().clone(),
+                    started: None,
                 });
-                // panic!("Expected name, found: {:?}", self.current());
             };
             let name = name.clone();
+            let span = self.current().span;
             self.advance();
             let pattern = if self.current().kind() == TokenKind::Colon {
                 self.advance();
                 let pattern = self.parse_pattern()?;
-                NamedPattern::Explicit { name, pattern }
+                span.merge(pattern.span)
+                    .attach(NamedPattern::Explicit { name, pattern })
             } else {
-                NamedPattern::Implicit(name)
+                span.attach(NamedPattern::Implicit(name))
             };
             patterns.push(pattern);
             if self.current().kind() == TokenKind::Comma {
@@ -384,7 +499,6 @@ impl Parser {
                 break;
             }
         }
-        self.expect(terminator, Some("end of named pattern list"))?;
         Ok(patterns)
     }
 
@@ -395,6 +509,7 @@ impl Parser {
 
         let first_pattern = self.parse_pattern()?;
         let pattern = if self.current().kind() == TokenKind::FatArrow {
+            let span = self.current().span;
             self.advance();
             let first_block = self.parse_block()?;
             let mut arms = vec![(first_pattern, first_block)];
@@ -408,7 +523,11 @@ impl Parser {
                     break;
                 }
                 let pattern = self.parse_pattern()?;
-                self.expect(TokenKind::FatArrow, Some("start of arrowed expression"))?;
+                self.expect(
+                    TokenKind::FatArrow,
+                    Some("start of arrowed expression"),
+                    Some(span),
+                )?;
                 let block = self.parse_block()?;
                 arms.push((pattern, block));
             }
@@ -429,35 +548,6 @@ impl Parser {
             }
             Pattern::Alternatives { patterns }
         };
-        self.expect(TokenKind::RBrace, Some("end of pattern group"))?;
         Ok(pattern)
-    }
-
-    pub fn pretty_print(&self, error: &Error) {
-        match error {
-            Error::Lexer(error) => self.lexer.pretty_print(error),
-            Error::Unexpected {
-                message,
-                expected,
-                found,
-            } => {
-                print!("error: ");
-                if let Some(message) = message {
-                    print!("Expected {message}");
-                    if expected.len() == 1 {
-                        print!(" (token: `{:?}`)", expected[0]);
-                    } else if expected.len() > 1 {
-                        print!(" (tokens: {:?})", expected);
-                    }
-                    print!(", found:");
-                } else if expected.len() == 1 {
-                    print!("Expected token `{:?}`, found:", expected[0]);
-                } else {
-                    print!("Unexpected");
-                }
-                println!(" token `{:?}`", found.data);
-                self.lexer.print_span(found.span);
-            }
-        }
     }
 }
