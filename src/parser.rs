@@ -80,15 +80,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn peek(&self, offset: usize) -> &Spanned<Token> {
-        let pos = self.pos + offset;
-        if pos < self.tokens.len() {
-            &self.tokens[pos]
-        } else {
-            &self.eof
-        }
-    }
-
     fn advance(&mut self) {
         if self.pos < self.tokens.len() {
             self.pos += 1;
@@ -179,6 +170,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary(&mut self) -> Result<Spanned<Expr>, Error> {
+        while self.current().kind() == TokenKind::Semicolon {
+            self.advance();
+        }
         let span = self.current().span;
         let expr = match &self.current().data {
             Token::True => {
@@ -206,6 +200,10 @@ impl<'a> Parser<'a> {
                 let last_span =
                     self.expect(TokenKind::RBracket, Some("end of array"), Some(span))?;
                 span.merge(last_span).attach(Expr::Array { args })
+            }
+            Token::LBrace => {
+                let block = self.parse_block()?;
+                block.span.attach(Expr::Block(block.data))
             }
             Token::Identifier(_) => {
                 let path = self.parse_path()?;

@@ -27,6 +27,8 @@ pub enum Expr {
     Identifier(String),
     Path(Path),
 
+    Block(Block),
+
     // [ expr, expr, ... ]
     Array {
         args: Vec<Spanned<Expr>>,
@@ -86,10 +88,10 @@ pub enum Pattern {
     // Literals
     True,
     False,
-    Wildcard,
     Integer(u64),
     Identifier(String),
     Path(Path),
+    Wildcard,
 
     // [ pat, pat, ... ]
     Array {
