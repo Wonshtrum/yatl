@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
@@ -6,14 +8,14 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn pretty_print(&self, source: &Source) {
+    pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
             Self::Unexpected(span) => {
-                println!(
-                    "error: Unexpected character `{}`",
+                out.write_fmt(format_args!(
+                    "error: Unexpected character `{}`\n",
                     source.substring(span.start, span.end)
-                );
-                source.print_span(*span);
+                ))?;
+                source.print_span(*span, out)
             }
         }
     }
@@ -372,7 +374,7 @@ impl<'a> Lexer<'a> {
                 let num = self.read_integer();
                 Token::Integer(num)
             }
-            Some(c) => {
+            Some(_) => {
                 return Err(Error::Unexpected(Span {
                     start,
                     end: start + 1,

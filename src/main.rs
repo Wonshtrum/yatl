@@ -2,6 +2,7 @@ mod ast;
 mod editor;
 mod lexer;
 mod parser;
+mod resolution;
 mod source;
 
 fn main() {

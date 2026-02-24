@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, Stdout, Write};
 
 use crossterm::{
     cursor,
@@ -13,6 +13,7 @@ use crossterm::{
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
 use crate::lexer::{self, Lexer, Token, TokenKind};
 use crate::parser::{self, Parser};
+use crate::resolution::{Env, resolve_expr};
 use crate::source::{Source, Span, Spanned};
 
 // ---------------------------------------------------------------------------
@@ -54,9 +55,7 @@ fn token_color(kind: TokenKind) -> Color {
         | TokenKind::GTE
         | TokenKind::LTE => Color::AnsiValue(130),
 
-        TokenKind::Eof => Color::Reset,
-
-        _ => Color::Black,
+        _ => Color::AnsiValue(236),
     }
 }
 
@@ -65,40 +64,267 @@ fn token_color(kind: TokenKind) -> Color {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct AstNode {
-    pub label: &'static str,
-    pub span: Span,
+struct AstNode {
+    label: &'static str,
+    span: Span,
 }
 
 // ---------------------------------------------------------------------------
 // Compiler output
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+enum ParserResult {
+    Ast(Vec<Spanned<Expr>>),
+    Error(String),
+}
+
 struct CompilerOutput {
     tokens: Vec<Spanned<Token>>,
     errors: Vec<Diagnostic>,
-    ast: Option<Vec<Spanned<Expr>>>,
+    result: ParserResult,
 }
 
 #[derive(Debug, Clone)]
-pub struct Diagnostic {
-    pub span: Span,
-    pub message: String,
+struct Diagnostic {
+    span: Span,
+    message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Panes
+// ---------------------------------------------------------------------------
+
+trait Pane {
+    fn label(&self) -> &str;
+    fn status(&self, ctx: &EditorContext) -> String;
+
+    fn on_focus(&mut self, _ctx: &mut EditorContext) {}
+    fn on_key(&mut self, _ctx: &mut EditorContext, _key: KeyEvent) {}
+
+    fn render(
+        &self,
+        ctx: &EditorContext,
+        stdout: &mut Stdout,
+        top_y: u16,
+        rows: usize,
+        cols: usize,
+    ) -> io::Result<()>;
+}
+
+struct BasePane {
+    cursor: usize,
+    scroll_row: usize,
+}
+impl BasePane {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            scroll_row: 0,
+        }
+    }
+    fn status(&self, source: &Source) -> String {
+        let pos = source.index_to_position(self.cursor);
+        format!(" {}:{} │ {}", pos.row + 1, pos.col + 1, source.len())
+    }
+    fn on_key(&mut self, source: &mut Source, key: KeyEvent, rows: usize) {
+        match key.code {
+            KeyCode::Left => self.move_cursor_by(source, -1),
+            KeyCode::Right => self.move_cursor_by(source, 1),
+            KeyCode::Up => self.move_cursor_line(source, -1),
+            KeyCode::Down => self.move_cursor_line(source, 1),
+            KeyCode::Home => self.move_cursor_home(source),
+            KeyCode::End => self.move_cursor_end(source),
+            KeyCode::Enter => self.move_cursor_line(source, 1),
+            KeyCode::Backspace => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
+            }
+            _ => {}
+        }
+        self.update_scroll(source, rows);
+    }
+
+    fn update_scroll(&mut self, source: &Source, rows: usize) {
+        let row = source.index_to_position(self.cursor).row;
+        if row < self.scroll_row {
+            self.scroll_row = row;
+        } else if row >= self.scroll_row + rows {
+            self.scroll_row = row + 1 - rows;
+        }
+    }
+
+    fn move_cursor_by(&mut self, source: &Source, delta: isize) {
+        self.cursor = (self.cursor as isize + delta).clamp(0, source.len() as isize) as usize;
+    }
+    fn move_cursor_line(&mut self, source: &Source, delta: isize) {
+        let pos = source.index_to_position(self.cursor);
+        let new_row =
+            (pos.row as isize + delta).clamp(0, source.line_count() as isize - 1) as usize;
+        self.cursor = source.position_to_index(new_row, pos.col);
+    }
+    fn move_cursor_home(&mut self, source: &Source) {
+        self.cursor = source.index_to_position(self.cursor).line_start;
+    }
+    fn move_cursor_end(&mut self, source: &Source) {
+        self.cursor = source.index_to_position(self.cursor).line_end;
+    }
+
+    fn render(
+        &self,
+        source: &Source,
+        stdout: &mut Stdout,
+        top_y: u16,
+        rows: usize,
+        cols: usize,
+    ) -> io::Result<()> {
+        const GUTTER: usize = 4;
+        let text_cols = cols.saturating_sub(GUTTER);
+        let cursor_row = source.index_to_position(self.cursor).row;
+
+        let visible: Vec<(usize, usize)> = source
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i >= self.scroll_row && *i < self.scroll_row + rows)
+            .map(|(_, b)| b)
+            .collect();
+
+        for (screen_row, (line_start, line_end)) in visible.iter().enumerate() {
+            let abs_row = self.scroll_row + screen_row;
+            let y = top_y + screen_row as u16;
+            let text: String = source.buffer[*line_start..*line_end]
+                .iter()
+                .take(text_cols)
+                .collect();
+            let padded = format!("{:<width$}", text, width = text_cols);
+
+            queue!(
+                stdout,
+                cursor::MoveTo(0, y),
+                SetForegroundColor(Color::AnsiValue(130)),
+                Print(format!("{:3} ", abs_row + 1)),
+                ResetColor,
+            )?;
+
+            if abs_row == cursor_row {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(Color::AnsiValue(236)),
+                    SetForegroundColor(Color::White),
+                    Print(&padded),
+                    ResetColor,
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetForegroundColor(Color::AnsiValue(236)),
+                    Print(&padded),
+                    ResetColor
+                )?;
+            }
+        }
+
+        for blank in visible.len()..rows {
+            queue!(
+                stdout,
+                cursor::MoveTo(0, top_y + blank as u16),
+                Print(format!("{:width$}", "", width = cols)),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+struct LogsPane(BasePane);
+impl LogsPane {
+    fn new() -> Self {
+        Self(BasePane::new())
+    }
+}
+impl Pane for LogsPane {
+    fn label(&self) -> &str {
+        "Logs"
+    }
+    fn status(&self, ctx: &EditorContext) -> String {
+        self.0.status(&ctx.logs)
+    }
+    fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
+        let rows = ctx.content_rows() as usize;
+        self.0.on_key(&mut ctx.logs, key, rows);
+    }
+    fn render(
+        &self,
+        ctx: &EditorContext,
+        stdout: &mut Stdout,
+        top_y: u16,
+        rows: usize,
+        cols: usize,
+    ) -> io::Result<()> {
+        self.0.render(&ctx.logs, stdout, top_y, rows, cols)
+    }
+}
+
+struct TextPane {
+    label: &'static str,
+    base: BasePane,
+    source: Source,
+    generate: fn(&EditorContext) -> String,
+}
+impl TextPane {
+    fn new(label: &'static str, generate: fn(&EditorContext) -> String) -> Self {
+        Self {
+            label,
+            base: BasePane::new(),
+            source: Source::empty(String::new()),
+            generate,
+        }
+    }
+}
+impl Pane for TextPane {
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn status(&self, _ctx: &EditorContext) -> String {
+        self.base.status(&self.source)
+    }
+    fn on_focus(&mut self, ctx: &mut EditorContext) {
+        let s = (self.generate)(ctx);
+        self.source = Source::new(String::new(), &s);
+    }
+    fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
+        let rows = ctx.content_rows() as usize;
+        self.base.on_key(&mut self.source, key, rows);
+    }
+    fn render(
+        &self,
+        _ctx: &EditorContext,
+        stdout: &mut Stdout,
+        top_y: u16,
+        rows: usize,
+        cols: usize,
+    ) -> io::Result<()> {
+        self.base.render(&self.source, stdout, top_y, rows, cols)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Editor state
 // ---------------------------------------------------------------------------
 
-pub struct Editor {
+struct EditorContext {
     source: Source,
-    cursor: usize,
+    logs: Source,
     output: CompilerOutput,
     ast_path: Vec<AstNode>,
     ast_cursor: Option<usize>,
     term_size: (u16, u16),
-    scroll_row: usize,
+}
+
+pub struct Editor {
+    ctx: EditorContext,
+    panes: Vec<Box<dyn Pane>>,
+    active: usize,
 }
 
 impl Editor {
@@ -108,17 +334,44 @@ impl Editor {
 
     pub fn from_source(source: Source) -> Self {
         let term_size = terminal::size().unwrap_or((80, 24));
-        let mut editor = Self {
+        let mut ctx = EditorContext {
             source,
-            cursor: 0,
-            output: CompilerOutput::default(),
+            logs: Source::empty("logs".into()),
+            output: CompilerOutput {
+                errors: Vec::new(),
+                tokens: Vec::new(),
+                result: ParserResult::Error("".into()),
+            },
             ast_cursor: None,
             ast_path: Vec::new(),
             term_size,
-            scroll_row: 0,
         };
-        editor.recompile();
-        editor
+        ctx.log("started");
+        ctx.recompile();
+        Self {
+            ctx,
+            panes: vec![
+                Box::new(EditorPane::new()),
+                Box::new(LogsPane::new()),
+                Box::new(TextPane::new("Parser", |ctx| match &ctx.output.result {
+                    ParserResult::Ast(exprs) => format!("{exprs:#?}"),
+                    ParserResult::Error(error) => error.clone(),
+                })),
+                Box::new(TextPane::new("Resolution", |ctx| {
+                    let ParserResult::Ast(exprs) = &ctx.output.result else {
+                        return "Parser failed — nothing to resolve.".into();
+                    };
+                    let mut env = Env::new();
+                    for expr in exprs {
+                        if let Err(error) = resolve_expr(&mut env, expr) {
+                            return format!("Resolution failed: {error:?}");
+                        }
+                    }
+                    "Resolution succeeded.".into()
+                })),
+            ],
+            active: 0,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -140,7 +393,7 @@ impl Editor {
                     }
                 }
                 Event::Resize(w, h) => {
-                    self.term_size = (w, h);
+                    self.ctx.term_size = (w, h);
                 }
                 _ => {}
             }
@@ -152,9 +405,83 @@ impl Editor {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Key handling
-    // -----------------------------------------------------------------------
+    fn render(&self, stdout: &mut Stdout) -> io::Result<()> {
+        let cols = self.ctx.term_size.0 as usize;
+        let content_rows = self.ctx.content_rows() as usize;
+        let diag_rows = self.ctx.diagnostic_line_count();
+        let status_y = self.ctx.term_size.1.saturating_sub(1);
+
+        self.render_tabs(stdout, cols)?;
+        self.panes[self.active].render(&self.ctx, stdout, 1, content_rows, cols)?;
+
+        let diag_top = 1u16 + content_rows as u16;
+        self.ctx
+            .render_diagnostics(stdout, diag_top, cols, diag_rows)?;
+
+        let status = pad(&self.panes[self.active].status(&self.ctx), cols);
+        queue!(
+            stdout,
+            cursor::MoveTo(0, status_y),
+            SetBackgroundColor(Color::DarkBlue),
+            SetForegroundColor(Color::White),
+            Print(status),
+            ResetColor,
+        )?;
+
+        stdout.flush()
+    }
+
+    fn render_tabs(&self, stdout: &mut Stdout, cols: usize) -> io::Result<()> {
+        queue!(stdout, cursor::MoveTo(0, 0))?;
+
+        queue!(
+            stdout,
+            SetBackgroundColor(Color::DarkBlue),
+            SetForegroundColor(Color::White),
+            Print("  │"),
+        )?;
+        let mut cursor = 3;
+        for (i, pane) in self.panes.iter().enumerate() {
+            let mut label = format!(" {}-{} ", i + 1, pane.label());
+            if cursor + label.chars().count() > cols {
+                label = pad(&label, cols - cursor);
+            }
+            if i == self.active {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(Color::White),
+                    SetForegroundColor(Color::DarkBlue),
+                    Print(&label),
+                    ResetColor,
+                )?;
+            } else {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(Color::DarkBlue),
+                    SetForegroundColor(Color::White),
+                    Print(&label),
+                    ResetColor,
+                )?;
+            }
+            cursor += label.chars().count() + 1;
+            if cursor >= cols {
+                return Ok(());
+            }
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::DarkBlue),
+                SetForegroundColor(Color::White),
+                Print("│"),
+            )?;
+        }
+        queue!(
+            stdout,
+            SetBackgroundColor(Color::DarkBlue),
+            Print(pad("", cols - cursor)),
+            ResetColor,
+        )?;
+        Ok(())
+    }
 
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -163,169 +490,33 @@ impl Editor {
         if ctrl && key.code == KeyCode::Char('c') {
             return true;
         }
-
         if alt {
-            match key.code {
-                KeyCode::Up => {
-                    self.ast_navigate_up();
+            if let KeyCode::Char(c) = key.code {
+                if let Some(digit) = c.to_digit(10) {
+                    let idx = (digit as usize).saturating_sub(1);
+                    if idx != self.active && idx < self.panes.len() {
+                        self.active = idx;
+                        self.panes[self.active].on_focus(&mut self.ctx);
+                    }
                     return false;
                 }
-                KeyCode::Down => {
-                    self.ast_navigate_down();
-                    return false;
-                }
-                _ => {}
             }
         }
 
-        match key.code {
-            KeyCode::Left => {
-                if alt {
-                    if let Some(idx) = self.ast_cursor {
-                        self.cursor = self.ast_path[idx].span.start;
-                    } else {
-                        self.move_node_left()
-                    }
-                } else if ctrl {
-                    self.move_token_left()
-                } else {
-                    self.move_cursor_by(-1)
-                }
-            }
-            KeyCode::Right => {
-                if alt {
-                    if let Some(idx) = self.ast_cursor {
-                        self.cursor = self.ast_path[idx].span.end;
-                    } else {
-                        self.move_node_right()
-                    }
-                } else if ctrl {
-                    self.move_token_right()
-                } else {
-                    self.move_cursor_by(1)
-                }
-            }
-            KeyCode::Up => self.move_cursor_line(-1),
-            KeyCode::Down => self.move_cursor_line(1),
-            KeyCode::Home => self.move_cursor_home(),
-            KeyCode::End => self.move_cursor_end(),
-
-            KeyCode::Char(c) => {
-                self.source.insert(self.cursor, c);
-                self.cursor += 1;
-                self.recompile();
-            }
-            KeyCode::Enter => {
-                self.source.insert(self.cursor, '\n');
-                self.cursor += 1;
-                self.recompile();
-            }
-            KeyCode::Backspace => {
-                if let Some(idx) = self.ast_cursor {
-                    let span = self.ast_path[idx].span;
-                    self.source.remove_span(span);
-                    self.cursor = span.start;
-                } else if self.cursor > 0 {
-                    self.cursor -= 1;
-                    self.source.remove(self.cursor);
-                }
-                self.recompile();
-            }
-            KeyCode::Delete => {
-                if let Some(idx) = self.ast_cursor {
-                    let span = self.ast_path[idx].span;
-                    self.source.remove_span(span);
-                    self.cursor = span.start;
-                } else if self.cursor < self.source.len() {
-                    self.source.remove(self.cursor);
-                }
-                self.recompile();
-            }
-            _ => {}
-        }
-
-        self.ast_cursor = None;
-        if let Some(ast) = &self.output.ast {
-            self.ast_path = ast_path_at(ast, self.cursor);
-        }
-        self.update_scroll();
+        self.panes[self.active].on_key(&mut self.ctx, key);
         false
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Cursor movement
-    // -----------------------------------------------------------------------
-
-    fn move_node_left(&mut self) {
-        if let Some(node) = self.ast_path.last() {
-            self.cursor = node.span.start;
-        } else {
-            self.move_token_left()
-        }
-    }
-
-    fn move_node_right(&mut self) {
-        if let Some(node) = self.ast_path.last() {
-            self.cursor = node.span.end.saturating_sub(1).max(node.span.start);
-        } else {
-            self.move_token_right()
-        }
-    }
-
-    fn move_token_left(&mut self) {
-        let pos = self.cursor;
-        let tokens = &self.output.tokens;
-        let idx = tokens.partition_point(|tok| tok.span.start < pos);
-        if let Some(tok) = tokens.get(idx.saturating_sub(1)) {
-            if self.cursor <= tok.span.start {
-                self.cursor = 0;
-            } else {
-                self.cursor = tok.span.start;
-            }
-        }
-    }
-
-    fn move_token_right(&mut self) {
-        let pos = self.cursor;
-        let tokens = &self.output.tokens;
-        let idx = tokens.partition_point(|tok| tok.span.start <= pos);
-        if let Some(tok) = tokens.get(idx) {
-            self.cursor = tok.span.start;
-        }
-    }
-
-    fn move_cursor_by(&mut self, delta: isize) {
-        self.cursor = (self.cursor as isize + delta).clamp(0, self.source.len() as isize) as usize;
-    }
-
-    fn move_cursor_line(&mut self, delta: isize) {
-        let pos = self.source.index_to_position(self.cursor);
-        let new_row =
-            (pos.row as isize + delta).clamp(0, self.source.line_count() as isize - 1) as usize;
-        self.cursor = self.source.position_to_index(new_row, pos.col);
-    }
-
-    fn move_cursor_home(&mut self) {
-        self.cursor = self.source.index_to_position(self.cursor).line_start;
-    }
-
-    fn move_cursor_end(&mut self) {
-        self.cursor = self.source.index_to_position(self.cursor).line_end;
-    }
-
-    fn update_scroll(&mut self) {
-        let row = self.source.index_to_position(self.cursor).row;
-        let visible = self.content_rows() as usize;
-        if row < self.scroll_row {
-            self.scroll_row = row;
-        } else if row >= self.scroll_row + visible {
-            self.scroll_row = row + 1 - visible;
-        }
-    }
-
-    fn content_rows(&self) -> u16 {
-        let reserved = 2u16 + self.diagnostic_line_count() as u16;
-        self.term_size.1.saturating_sub(reserved)
+impl EditorContext {
+    fn log(&mut self, message: &str) {
+        let now = time::OffsetDateTime::now_utc();
+        self.logs.append(format!(
+            "[{:02}:{:02}:{:02}] {message}\n",
+            now.hour(),
+            now.minute(),
+            now.second()
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -356,262 +547,50 @@ impl Editor {
 
     fn recompile(&mut self) {
         let mut errors: Vec<Diagnostic> = Vec::new();
-        let mut ast = self.output.ast.take();
 
         let mut lexer = Lexer::new(&self.source);
         let tokens = match lexer.tokenize() {
             Ok(tokens) => tokens,
             Err(error) => {
                 let (span, message) = lex_error_info(&error);
-                errors.push(Diagnostic { span, message });
-                self.output.errors = errors;
+                let mut out = String::new();
+                let _ = error.pretty_print(&self.source, &mut out);
+                self.output = CompilerOutput {
+                    tokens: Vec::new(),
+                    errors: vec![Diagnostic { span, message }],
+                    result: ParserResult::Error(out),
+                };
                 return;
             }
         };
 
         let mut parser = Parser::new(&self.source, tokens.clone());
-        match parser.parse() {
-            Ok(exprs) => ast = Some(exprs),
+        let result = match parser.parse() {
+            Ok(exprs) => ParserResult::Ast(exprs),
             Err(error) => {
                 let (span, message) = parser_error_info(&error);
+                let mut out = String::new();
+                let _ = error.pretty_print(&self.source, &mut out);
                 errors.push(Diagnostic { span, message });
+                ParserResult::Error(out)
             }
-        }
+        };
 
         self.output = CompilerOutput {
             tokens,
             errors,
-            ast,
+            result,
         };
-    }
-
-    // -----------------------------------------------------------------------
-    // Rendering
-    // -----------------------------------------------------------------------
-
-    fn render<W: Write>(&self, stdout: &mut W) -> io::Result<()> {
-        let cols = self.term_size.0 as usize;
-        let content_rows = self.content_rows() as usize;
-        let diag_rows = self.diagnostic_line_count();
-
-        let highlight_span: Option<Span> = self.ast_cursor.map(|idx| self.ast_path[idx].span);
-
-        let header = format!(
-            " Terse2 IDE  |  {}  |  Ctrl-C: quit  |  Alt-↑/↓: AST nav",
-            self.source.name
-        );
-        queue!(
-            stdout,
-            cursor::MoveTo(0, 0),
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::DarkBlue),
-            Print(pad(&header, cols)),
-            ResetColor,
-        )?;
-
-        const GUTTER: usize = 4;
-        let text_cols = cols.saturating_sub(GUTTER);
-
-        let source_lines: Vec<(usize, usize)> = self
-            .source
-            .lines()
-            .enumerate()
-            .filter(|(i, _)| *i >= self.scroll_row && *i < self.scroll_row + content_rows)
-            .map(|(_, b)| b)
-            .collect();
-
-        for (screen_row, (line_start, line_end)) in source_lines.iter().enumerate() {
-            let y = screen_row as u16 + 1;
-            queue!(
-                stdout,
-                cursor::MoveTo(0, y),
-                SetForegroundColor(Color::AnsiValue(130)),
-                Print(format!("{:3} ", self.scroll_row + screen_row + 1)),
-                ResetColor,
-            )?;
-
-            self.render_line(stdout, *line_start, *line_end, text_cols, highlight_span)?;
-        }
-
-        for blank in source_lines.len()..content_rows {
-            queue!(
-                stdout,
-                cursor::MoveTo(0, blank as u16 + 1),
-                Print(format!("{:width$}", "", width = cols)),
-            )?;
-        }
-
-        let diag_top = 1 + content_rows as u16;
-        self.render_diagnostics(stdout, diag_top, cols, diag_rows)?;
-
-        let status_y = self.term_size.1.saturating_sub(1);
-        queue!(
-            stdout,
-            cursor::MoveTo(0, status_y),
-            SetBackgroundColor(Color::DarkBlue),
-            SetForegroundColor(Color::White),
-            Print(pad(&self.build_status(), cols)),
-            ResetColor,
-        )?;
-
-        stdout.flush()
-    }
-
-    fn render_line<W: Write>(
-        &self,
-        stdout: &mut W,
-        line_start: usize,
-        line_end: usize,
-        max_cols: usize,
-        highlight_span: Option<Span>,
-    ) -> io::Result<()> {
-        let tokens = &self.output.tokens;
-        let mut col = 0usize;
-        let mut offset = line_start;
-        let mut tok_idx = tokens.partition_point(|tok| tok.span.end <= line_start);
-
-        while offset < line_end && col < max_cols {
-            let next_tok_start = tokens
-                .get(tok_idx)
-                .map(|tok| tok.span.start)
-                .unwrap_or(usize::MAX);
-
-            if offset < next_tok_start {
-                let gap_end = next_tok_start.min(line_end);
-                col += self.render_segment(
-                    stdout,
-                    offset,
-                    gap_end,
-                    Color::DarkGrey,
-                    highlight_span,
-                    col,
-                    max_cols,
-                )?;
-                offset = gap_end;
-                continue;
-            }
-
-            let Some(tok) = tokens.get(tok_idx) else {
-                break;
-            };
-            if tok.span.start >= line_end {
-                break;
-            }
-
-            let tok_end = tok.span.end.min(line_end);
-            col += self.render_segment(
-                stdout,
-                offset,
-                tok_end,
-                token_color(tok.kind()),
-                highlight_span,
-                col,
-                max_cols,
-            )?;
-            offset = tok_end;
-            tok_idx += 1;
-        }
-
-        if self.cursor == line_end && col < max_cols {
-            queue!(
-                stdout,
-                SetBackgroundColor(Color::Black),
-                Print(' '),
-                ResetColor
-            )?;
-            col += 1;
-        }
-
-        if col < max_cols {
-            queue!(
-                stdout,
-                Print(format!("{:width$}", "", width = max_cols - col))
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn render_segment<W: Write>(
-        &self,
-        stdout: &mut W,
-        start: usize,
-        end: usize,
-        base_color: Color,
-        highlight_span: Option<Span>,
-        col_offset: usize,
-        max_cols: usize,
-    ) -> io::Result<usize> {
-        let cursor_inside = self.cursor >= start && self.cursor < end;
-        let hl_inside = highlight_span
-            .map(|s| s.start < end && s.end > start)
-            .unwrap_or(false);
-        let err_inside = self
-            .output
-            .errors
-            .iter()
-            .any(|e| e.span.start < end && e.span.end > start);
-
-        if !cursor_inside && !hl_inside && !err_inside {
-            let len = (max_cols - col_offset).min(end - start);
-            if len == 0 {
-                return Ok(0);
-            }
-            let text = self.source.substring(start, start + len);
-            queue!(
-                stdout,
-                SetForegroundColor(base_color),
-                Print(&text),
-                ResetColor
-            )?;
-            return Ok(len);
-        }
-
-        let mut count = 0;
-        for offset in start..end {
-            if col_offset + count >= max_cols {
-                break;
-            }
-            let c = self.source.buffer[offset];
-            let is_cursor = offset == self.cursor;
-            let is_hl = highlight_span.map(|s| s.contains(offset)).unwrap_or(false);
-            let is_err = self.output.errors.iter().any(|e| e.span.contains(offset));
-
-            if is_cursor {
-                queue!(
-                    stdout,
-                    SetBackgroundColor(base_color),
-                    SetForegroundColor(Color::White),
-                    Print(c),
-                    ResetColor,
-                )?;
-            } else if is_hl {
-                queue!(
-                    stdout,
-                    SetBackgroundColor(Color::Grey),
-                    SetForegroundColor(base_color),
-                    Print(c),
-                    ResetColor,
-                )?;
-            } else if is_err {
-                queue!(
-                    stdout,
-                    SetForegroundColor(Color::White),
-                    SetBackgroundColor(Color::Red),
-                    Print(c),
-                    ResetColor,
-                )?;
-            } else {
-                queue!(stdout, SetForegroundColor(base_color), Print(c), ResetColor)?;
-            }
-            count += 1;
-        }
-        Ok(count)
     }
 
     // -----------------------------------------------------------------------
     // Diagnostics
     // -----------------------------------------------------------------------
+
+    fn content_rows(&self) -> u16 {
+        let reserved = 2u16 + self.diagnostic_line_count() as u16;
+        self.term_size.1.saturating_sub(reserved)
+    }
 
     fn diagnostic_line_count(&self) -> usize {
         if self.output.errors.is_empty() {
@@ -621,9 +600,9 @@ impl Editor {
         }
     }
 
-    fn render_diagnostics<W: Write>(
+    fn render_diagnostics(
         &self,
-        stdout: &mut W,
+        stdout: &mut Stdout,
         top_y: u16,
         cols: usize,
         rows: usize,
@@ -659,17 +638,32 @@ impl Editor {
 
         Ok(())
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Status bar
-    // -----------------------------------------------------------------------
+struct EditorPane(BasePane);
+impl std::ops::Deref for EditorPane {
+    type Target = BasePane;
+    fn deref(&self) -> &BasePane {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for EditorPane {
+    fn deref_mut(&mut self) -> &mut BasePane {
+        &mut self.0
+    }
+}
 
-    fn build_status(&self) -> String {
-        let pos = self.source.index_to_position(self.cursor);
+impl Pane for EditorPane {
+    fn label(&self) -> &str {
+        "Editor"
+    }
+
+    fn status(&self, ctx: &EditorContext) -> String {
+        let pos = ctx.source.index_to_position(self.cursor);
         let loc = format!("{}:{}", pos.row + 1, pos.col + 1);
 
         let token_info = {
-            let tokens = &self.output.tokens;
+            let tokens = &ctx.output.tokens;
             let idx = tokens.partition_point(|tok| tok.span.end <= self.cursor);
             tokens
                 .get(idx)
@@ -678,28 +672,382 @@ impl Editor {
                 .unwrap_or_else(|| "—".into())
         };
 
-        let ast_info = if let Some(idx) = self.ast_cursor {
-            let node = &self.ast_path[idx];
+        let ast_info = if let Some(idx) = ctx.ast_cursor {
+            let node = &ctx.ast_path[idx];
             format!(
                 "AST [{}/{}] {}  {}..{}",
                 idx + 1,
-                self.ast_path.len(),
+                ctx.ast_path.len(),
                 node.label,
                 node.span.start,
                 node.span.end,
             )
-        } else if let Some(deepest) = self.ast_path.last() {
+        } else if let Some(deepest) = ctx.ast_path.last() {
             format!("AST: {}", deepest.label)
         } else {
             "AST: —".into()
         };
 
-        let ok = if self.output.errors.is_empty() {
+        let ok = if ctx.output.errors.is_empty() {
             "✓"
         } else {
             ""
         };
-        format!(" {} | {} | {} | {} ", loc, token_info, ast_info, ok)
+        format!(" {} │ {} │ {} │ {} ", loc, token_info, ast_info, ok)
+    }
+
+    fn on_focus(&mut self, ctx: &mut EditorContext) {
+        ctx.log("editor focus");
+    }
+
+    fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        if alt {
+            match key.code {
+                KeyCode::Up => {
+                    ctx.ast_navigate_up();
+                    return;
+                }
+                KeyCode::Down => {
+                    ctx.ast_navigate_down();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Left => {
+                if alt {
+                    if let Some(idx) = ctx.ast_cursor {
+                        self.cursor = ctx.ast_path[idx].span.start;
+                    } else {
+                        self.move_node_left(ctx);
+                    }
+                } else if ctrl {
+                    self.move_token_left(ctx);
+                } else {
+                    self.move_cursor_by(&ctx.source, -1);
+                }
+            }
+            KeyCode::Right => {
+                if alt {
+                    if let Some(idx) = ctx.ast_cursor {
+                        self.cursor = ctx.ast_path[idx].span.end;
+                    } else {
+                        self.move_node_right(ctx);
+                    }
+                } else if ctrl {
+                    self.move_token_right(ctx);
+                } else {
+                    self.move_cursor_by(&ctx.source, 1);
+                }
+            }
+            KeyCode::Up => self.move_cursor_line(&ctx.source, -1),
+            KeyCode::Down => self.move_cursor_line(&ctx.source, 1),
+            KeyCode::Home => self.move_cursor_home(&ctx.source),
+            KeyCode::End => self.move_cursor_end(&ctx.source),
+
+            KeyCode::Char(c) => {
+                ctx.source.insert(self.cursor, c);
+                self.cursor += 1;
+                ctx.recompile();
+            }
+            KeyCode::Enter => {
+                ctx.source.insert(self.cursor, '\n');
+                self.cursor += 1;
+                ctx.recompile();
+            }
+            KeyCode::Backspace => {
+                if let Some(idx) = ctx.ast_cursor {
+                    let span = ctx.ast_path[idx].span;
+                    ctx.source.remove_span(span);
+                    self.cursor = span.start;
+                } else if self.cursor > 0 {
+                    self.cursor -= 1;
+                    ctx.source.remove(self.cursor);
+                }
+                ctx.recompile();
+            }
+            KeyCode::Delete => {
+                if let Some(idx) = ctx.ast_cursor {
+                    let span = ctx.ast_path[idx].span;
+                    ctx.source.remove_span(span);
+                    self.cursor = span.start;
+                } else if self.cursor < ctx.source.len() {
+                    ctx.source.remove(self.cursor);
+                }
+                ctx.recompile();
+            }
+            _ => {}
+        }
+
+        ctx.ast_cursor = None;
+        if let ParserResult::Ast(ast) = &ctx.output.result {
+            ctx.ast_path = ast_path_at(ast, self.cursor);
+        }
+        self.update_scroll(&ctx.source, ctx.content_rows() as usize);
+    }
+
+    fn render(
+        &self,
+        ctx: &EditorContext,
+        stdout: &mut Stdout,
+        top_y: u16,
+        rows: usize,
+        cols: usize,
+    ) -> io::Result<()> {
+        let highlight_span: Option<Span> = ctx.ast_cursor.map(|idx| ctx.ast_path[idx].span);
+
+        const GUTTER: usize = 4;
+        let text_cols = cols.saturating_sub(GUTTER);
+
+        let source_lines: Vec<(usize, usize)> = ctx
+            .source
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i >= self.scroll_row && *i < self.scroll_row + rows)
+            .map(|(_, b)| b)
+            .collect();
+
+        for (screen_row, (line_start, line_end)) in source_lines.iter().enumerate() {
+            let y = top_y + screen_row as u16;
+            queue!(
+                stdout,
+                cursor::MoveTo(0, y),
+                SetForegroundColor(Color::AnsiValue(130)),
+                Print(format!("{:3} ", self.scroll_row + screen_row + 1)),
+                ResetColor,
+            )?;
+
+            self.render_line(
+                ctx,
+                stdout,
+                *line_start,
+                *line_end,
+                text_cols,
+                highlight_span,
+            )?;
+        }
+
+        for blank in source_lines.len()..rows {
+            queue!(
+                stdout,
+                cursor::MoveTo(0, top_y + blank as u16),
+                Print(format!("{:width$}", "", width = cols)),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl EditorPane {
+    fn new() -> Self {
+        Self(BasePane::new())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cursor movement
+    // -----------------------------------------------------------------------
+
+    fn move_node_left(&mut self, ctx: &EditorContext) {
+        if let Some(node) = ctx.ast_path.last() {
+            self.cursor = node.span.start;
+        } else {
+            self.move_token_left(ctx);
+        }
+    }
+
+    fn move_node_right(&mut self, ctx: &EditorContext) {
+        if let Some(node) = ctx.ast_path.last() {
+            self.cursor = node.span.end.saturating_sub(1).max(node.span.start);
+        } else {
+            self.move_token_right(ctx);
+        }
+    }
+
+    fn move_token_left(&mut self, ctx: &EditorContext) {
+        let pos = self.cursor;
+        let tokens = &ctx.output.tokens;
+        let idx = tokens.partition_point(|tok| tok.span.start < pos);
+        if let Some(tok) = tokens.get(idx.saturating_sub(1)) {
+            self.cursor = if pos <= tok.span.start {
+                0
+            } else {
+                tok.span.start
+            };
+        }
+    }
+
+    fn move_token_right(&mut self, ctx: &EditorContext) {
+        let pos = self.cursor;
+        let tokens = &ctx.output.tokens;
+        let idx = tokens.partition_point(|tok| tok.span.start <= pos);
+        if let Some(tok) = tokens.get(idx) {
+            self.cursor = tok.span.start;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering
+    // -----------------------------------------------------------------------
+
+    fn render_line(
+        &self,
+        ctx: &EditorContext,
+        stdout: &mut Stdout,
+        line_start: usize,
+        line_end: usize,
+        max_cols: usize,
+        highlight_span: Option<Span>,
+    ) -> io::Result<()> {
+        let tokens = &ctx.output.tokens;
+        let mut col = 0usize;
+        let mut offset = line_start;
+        let mut tok_idx = tokens.partition_point(|tok| tok.span.end <= line_start);
+
+        while offset < line_end && col < max_cols {
+            let next_tok_start = tokens
+                .get(tok_idx)
+                .map(|tok| tok.span.start)
+                .unwrap_or(usize::MAX);
+
+            if offset < next_tok_start {
+                let gap_end = next_tok_start.min(line_end);
+                col += self.render_segment(
+                    ctx,
+                    stdout,
+                    offset,
+                    gap_end,
+                    Color::DarkGrey,
+                    highlight_span,
+                    col,
+                    max_cols,
+                )?;
+                offset = gap_end;
+                continue;
+            }
+
+            let Some(tok) = tokens.get(tok_idx) else {
+                break;
+            };
+            if tok.span.start >= line_end {
+                break;
+            }
+
+            let tok_end = tok.span.end.min(line_end);
+            col += self.render_segment(
+                ctx,
+                stdout,
+                offset,
+                tok_end,
+                token_color(tok.kind()),
+                highlight_span,
+                col,
+                max_cols,
+            )?;
+            offset = tok_end;
+            tok_idx += 1;
+        }
+
+        if self.cursor == line_end && col < max_cols {
+            queue!(
+                stdout,
+                SetBackgroundColor(Color::Black),
+                Print(' '),
+                ResetColor
+            )?;
+            col += 1;
+        }
+
+        if col < max_cols {
+            queue!(
+                stdout,
+                Print(format!("{:width$}", "", width = max_cols - col))
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn render_segment(
+        &self,
+        ctx: &EditorContext,
+        stdout: &mut Stdout,
+        start: usize,
+        end: usize,
+        base_color: Color,
+        highlight_span: Option<Span>,
+        col_offset: usize,
+        max_cols: usize,
+    ) -> io::Result<usize> {
+        let cursor_inside = self.cursor >= start && self.cursor < end;
+        let hl_inside = highlight_span
+            .map(|s| s.start < end && s.end > start)
+            .unwrap_or(false);
+        let err_inside = ctx
+            .output
+            .errors
+            .iter()
+            .any(|e| e.span.start < end && e.span.end > start);
+
+        if !cursor_inside && !hl_inside && !err_inside {
+            let len = (max_cols - col_offset).min(end - start);
+            if len == 0 {
+                return Ok(0);
+            }
+            let text = ctx.source.substring(start, start + len);
+            queue!(
+                stdout,
+                SetForegroundColor(base_color),
+                Print(&text),
+                ResetColor
+            )?;
+            return Ok(len);
+        }
+
+        let mut count = 0;
+        for offset in start..end {
+            if col_offset + count >= max_cols {
+                break;
+            }
+            let c = ctx.source.buffer[offset];
+            let is_cursor = offset == self.cursor;
+            let is_hl = highlight_span.map(|s| s.contains(offset)).unwrap_or(false);
+            let is_err = ctx.output.errors.iter().any(|e| e.span.contains(offset));
+
+            if is_cursor {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(base_color),
+                    SetForegroundColor(Color::White),
+                    Print(c),
+                    ResetColor,
+                )?;
+            } else if is_hl {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(Color::Grey),
+                    SetForegroundColor(base_color),
+                    Print(c),
+                    ResetColor,
+                )?;
+            } else if is_err {
+                queue!(
+                    stdout,
+                    SetBackgroundColor(Color::Red),
+                    SetForegroundColor(Color::White),
+                    Print(c),
+                    ResetColor,
+                )?;
+            } else {
+                queue!(stdout, SetForegroundColor(base_color), Print(c), ResetColor)?;
+            }
+            count += 1;
+        }
+        Ok(count)
     }
 }
 
@@ -971,12 +1319,12 @@ fn parser_error_info(error: &parser::Error) -> (Span, String) {
             ..
         } => {
             let msg = if let Some(m) = message {
-                if expected.len() > 0 {
+                if !expected.is_empty() {
                     format!("Expected {} ({:?}), found {:?}", m, expected[0], found.data)
                 } else {
                     format!("Expected {}, found {:?}", m, found.data)
                 }
-            } else if expected.len() > 0 {
+            } else if !expected.is_empty() {
                 format!("Expected {:?}, found {:?}", expected[0], found.data)
             } else {
                 format!("Unexpected {:?}", found.data)

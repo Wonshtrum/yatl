@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -14,7 +14,7 @@ impl Span {
         }
     }
 
-    pub fn attach<T: Debug + Clone>(self, data: T) -> Spanned<T> {
+    pub fn attach<T: Clone>(self, data: T) -> Spanned<T> {
         Spanned { data, span: self }
     }
 
@@ -27,19 +27,25 @@ impl Span {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Spanned<T: Debug + Clone> {
+#[derive(Clone)]
+pub struct Spanned<T: Clone> {
     pub data: T,
     pub span: Span,
 }
 
-impl<T: Debug + Clone> Spanned<T> {
+impl<T: fmt::Debug + Clone> fmt::Debug for Spanned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.data.fmt(f)
+    }
+}
+
+impl<T: fmt::Debug + Clone> Spanned<T> {
     pub fn contains(&self, pos: usize) -> bool {
         self.span.contains(pos)
     }
 }
 
-impl<T: Debug + Clone> std::ops::Deref for Spanned<T> {
+impl<T: fmt::Debug + Clone> std::ops::Deref for Spanned<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.data
@@ -103,6 +109,16 @@ impl Source {
     pub fn insert(&mut self, pos: usize, c: char) {
         self.buffer.insert(pos, c);
         self.rebuild_nl_map();
+    }
+
+    pub fn append(&mut self, chunk: String) {
+        let nl_map = chunk
+            .chars()
+            .enumerate()
+            .filter_map(|(i, c)| (c == '\n').then_some(i + self.buffer.len()))
+            .collect::<Vec<_>>();
+        self.nl_map.extend(nl_map);
+        self.buffer.extend(chunk.chars().collect::<Vec<_>>());
     }
 
     pub fn remove(&mut self, pos: usize) {
@@ -173,16 +189,27 @@ impl Source {
     // Diagnostic
     // -----------------------------------------------------------------------
 
-    pub fn print_span(&self, span: Span) {
+    pub fn print_span<W: fmt::Write>(&self, span: Span, out: &mut W) -> fmt::Result {
         let pos = self.index_to_position(span.start);
-        println!("   --> {}:{}:{}", self.name, pos.row + 1, pos.col + 1);
-        println!("    |");
-        println!(
-            "{: <3} | {}",
+        out.write_fmt(format_args!(
+            "   --> {}:{}:{}\n",
+            self.name,
+            pos.row + 1,
+            pos.col + 1
+        ))?;
+        out.write_str("    |\n")?;
+        out.write_fmt(format_args!(
+            "{: <3} | {}\n",
             pos.row + 1,
             self.substring(pos.line_start, pos.line_end)
-        );
+        ))?;
         let len = (span.end - span.start).max(1);
-        println!("    | {: >col$}{:^>len$}", "", "", col = pos.col, len = len,);
+        out.write_fmt(format_args!(
+            "    | {: >col$}{:^>len$}\n",
+            "",
+            "",
+            col = pos.col,
+            len = len
+        ))
     }
 }

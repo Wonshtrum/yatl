@@ -1,9 +1,20 @@
+use std::fmt;
+
 use crate::source::Spanned;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Path {
     pub name: String,
     pub parents: Vec<String>,
+}
+
+impl Path {
+    pub fn top(&self) -> &str {
+        if let Some(top) = self.parents.first() {
+            return top;
+        }
+        &self.name
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -12,13 +23,13 @@ pub struct Block {
     pub value: Option<Box<Spanned<Expr>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum NamedExpr {
     Implicit(String),
     Explicit { name: String, expr: Spanned<Expr> },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Expr {
     // Literals
     True,
@@ -74,7 +85,7 @@ pub enum Expr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum NamedPattern {
     Implicit(String),
     Explicit {
@@ -83,7 +94,7 @@ pub enum NamedPattern {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Pattern {
     // Literals
     True,
@@ -120,4 +131,158 @@ pub enum Pattern {
     MatchArms {
         arms: Vec<(Spanned<Pattern>, Spanned<Block>)>,
     },
+}
+
+impl fmt::Debug for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Path(\"")?;
+        for p in self.parents.iter() {
+            f.write_str(p)?;
+            f.write_str("\", \"")?;
+        }
+        f.write_str(&self.name)?;
+        f.write_str("\")")
+    }
+}
+
+impl fmt::Debug for NamedExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Implicit(x) => f.write_fmt(format_args!("Implicit({x})")),
+            Self::Explicit { name, expr } => f
+                .debug_struct("Explicit")
+                .field("name", name)
+                .field("expr", expr)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::True => f.write_str("True"),
+            Self::False => f.write_str("False"),
+            Self::Integer(x) => f.write_fmt(format_args!("Integer({x})")),
+            Self::Identifier(x) => f.write_fmt(format_args!("Identifier({x:?})")),
+            Self::Path(x) => x.fmt(f),
+            Self::Block(x) => x.fmt(f),
+            Self::Array { args } => {
+                let mut t = f.debug_tuple("Array");
+                for arg in args {
+                    t.field(arg);
+                }
+                t.finish()
+            }
+            Self::Tuple { args } => {
+                let mut t = f.debug_tuple("Tuple");
+                for arg in args {
+                    t.field(arg);
+                }
+                t.finish()
+            }
+            Self::Constructor { name, args } => f
+                .debug_struct("Constructor")
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Self::NamedConstructor { name, args } => f
+                .debug_struct("NamedConstructor")
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Self::Binding { expr, pattern } => f
+                .debug_struct("Binding")
+                .field("expr", expr)
+                .field("pattern", pattern)
+                .finish(),
+            Self::ThenFlow {
+                condition,
+                then_block,
+            } => f
+                .debug_struct("ThenFlow")
+                .field("condition", condition)
+                .field("then_block", then_block)
+                .finish(),
+            Self::ElseFlow {
+                condition,
+                else_block,
+            } => f
+                .debug_struct("ElseFlow")
+                .field("condition", condition)
+                .field("else_block", else_block)
+                .finish(),
+            Self::ThenElseFlow {
+                condition,
+                then_block,
+                else_block,
+            } => f
+                .debug_struct("ThenElseFlow")
+                .field("condition", condition)
+                .field("then_block", then_block)
+                .field("else_block", else_block)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Debug for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::True => f.write_str("True"),
+            Self::False => f.write_str("False"),
+            Self::Integer(x) => f.write_fmt(format_args!("Integer({x})")),
+            Self::Identifier(x) => f.write_fmt(format_args!("Identifier({x:?})")),
+            Self::Path(x) => x.fmt(f),
+            Self::Wildcard => f.write_str("_"),
+            Self::Array { patterns } => {
+                let mut t = f.debug_tuple("Array");
+                for pat in patterns {
+                    t.field(pat);
+                }
+                t.finish()
+            }
+            Self::Tuple { patterns } => {
+                let mut t = f.debug_tuple("Tuple");
+                for pat in patterns {
+                    t.field(pat);
+                }
+                t.finish()
+            }
+            Self::Constructor { name, patterns } => f
+                .debug_struct("Constructor")
+                .field("name", name)
+                .field("patterns", patterns)
+                .finish(),
+            Self::NamedConstructor { name, patterns } => f
+                .debug_struct("NamedConstructor")
+                .field("name", name)
+                .field("patterns", patterns)
+                .finish(),
+            Self::Alternatives { patterns } => f
+                .debug_struct("Alternatives")
+                .field("patterns", patterns)
+                .finish(),
+            Self::MatchArms { arms } => {
+                let mut t = f.debug_tuple("MatchArms");
+                for arm in arms {
+                    t.field(arm);
+                }
+                t.finish()
+            }
+        }
+    }
+}
+
+impl fmt::Debug for NamedPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Implicit(x) => f.write_fmt(format_args!("Implicit({x})")),
+            Self::Explicit { name, pattern } => f
+                .debug_struct("Explicit")
+                .field("name", name)
+                .field("pattern", pattern)
+                .finish(),
+        }
+    }
 }

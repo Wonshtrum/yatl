@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::source::{Source, Span, Spanned};
@@ -14,35 +16,39 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn pretty_print(&self, source: &Source) {
+    pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
         match self {
-            Self::Lexer(error) => error.pretty_print(source),
+            Self::Lexer(error) => error.pretty_print(source, out),
             Self::Unexpected {
                 message,
                 expected,
                 found,
                 started,
             } => {
-                print!("error: ");
+                out.write_str("error: ")?;
                 if let Some(message) = message {
-                    print!("Expected {message}");
+                    out.write_fmt(format_args!("Expected {message}"))?;
                     if expected.len() == 1 {
-                        print!(" (token `{:?}`)", expected[0]);
+                        out.write_fmt(format_args!(" (token `{:?}`)", expected[0]))?;
                     } else if expected.len() > 1 {
-                        print!(" (tokens {:?})", expected);
+                        out.write_fmt(format_args!(" (tokens {:?})", expected))?;
                     }
-                    print!(", but found");
+                    out.write_str(", but found")?;
                 } else if expected.len() == 1 {
-                    print!("Expected token `{:?}`, but found", expected[0]);
+                    out.write_fmt(format_args!(
+                        "Expected token `{:?}`, but found",
+                        expected[0]
+                    ))?;
                 } else {
-                    print!("Unexpected");
+                    out.write_str("Unexpected")?;
                 }
-                println!(" token `{:?}`", found.data);
-                source.print_span(found.span);
+                out.write_fmt(format_args!(" token `{:?}`\n", found.data))?;
+                source.print_span(found.span, out)?;
                 if let Some(started) = started {
-                    println!("note: Started by");
-                    source.print_span(*started);
+                    out.write_str("note: Started by\n")?;
+                    source.print_span(*started, out)?;
                 }
+                Ok(())
             }
         }
     }
