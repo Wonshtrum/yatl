@@ -1,12 +1,27 @@
 use std::collections::HashMap;
 
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Pattern};
+use crate::log;
+use crate::source::{Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
+    Reached,
     NotInScope(String),
 }
 
+impl<T> Spanned<T> {
+    fn is_at<'a>(&self, target: Option<Span>, env: &Env<'a>) -> Result<(), Error> {
+        if let Some(target) = target {
+            if self.span == target {
+                return Err(Error::Reached);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub struct Env<'a> {
     pub id: u32,
     pub parent: Option<&'a Env<'a>>,
@@ -43,10 +58,14 @@ impl<'a> Env<'a> {
     }
 }
 
-pub fn resolve_expr<'a>(env: &mut Env<'a>, expr: &Expr) -> Result<(), Error> {
-    match expr {
+pub fn resolve_expr<'a>(
+    env: &mut Env<'a>,
+    expr: &Spanned<Expr>,
+    target: Option<Span>,
+) -> Result<(), Error> {
+    log!("{} {:?}", expr.label(), expr.span);
+    match &expr.data {
         Expr::True | Expr::False | Expr::Integer(_) => {}
-
         Expr::Identifier(ident) => {
             env.find(ident)?;
         }
@@ -54,17 +73,17 @@ pub fn resolve_expr<'a>(env: &mut Env<'a>, expr: &Expr) -> Result<(), Error> {
             env.find(path.top())?;
         }
         Expr::Block(block) => {
-            resolve_block(env, block)?;
+            resolve_raw_block(env, block, target)?;
         }
         Expr::Array { args } | Expr::Tuple { args } => {
             for arg in args {
-                resolve_expr(env, arg)?;
+                resolve_expr(env, arg, target)?;
             }
         }
         Expr::Constructor { name, args } => {
             env.find(name.top())?;
             for arg in args {
-                resolve_expr(env, arg)?;
+                resolve_expr(env, arg, target)?;
             }
         }
         Expr::NamedConstructor { name, args } => {
@@ -75,29 +94,29 @@ pub fn resolve_expr<'a>(env: &mut Env<'a>, expr: &Expr) -> Result<(), Error> {
                         env.find(ident)?;
                     }
                     NamedExpr::Explicit { expr, .. } => {
-                        resolve_expr(env, expr)?;
+                        resolve_expr(env, expr, target)?;
                     }
                 }
             }
         }
         Expr::Binding { expr, pattern } => {
-            resolve_expr(env, expr)?;
-            resolve_pattern(env, pattern)?;
+            resolve_expr(env, expr, target)?;
+            resolve_pattern(env, pattern, target)?;
         }
         Expr::ThenFlow {
             condition,
             then_block,
         } => {
             let mut nested = env.push();
-            resolve_expr(&mut nested, &condition.data)?;
-            resolve_block(&mut nested, &then_block.data)?;
+            resolve_expr(&mut nested, condition, target)?;
+            resolve_block(&mut nested, then_block, target)?;
         }
         Expr::ElseFlow {
             condition,
             else_block,
         } => {
-            resolve_expr(env, condition)?;
-            resolve_block(env, &else_block.data)?;
+            resolve_expr(env, condition, target)?;
+            resolve_block(env, else_block, target)?;
         }
         Expr::ThenElseFlow {
             condition,
@@ -105,43 +124,59 @@ pub fn resolve_expr<'a>(env: &mut Env<'a>, expr: &Expr) -> Result<(), Error> {
             else_block,
         } => {
             let mut nested = env.push();
-            resolve_expr(&mut nested, condition)?;
-            resolve_block(&mut nested, &then_block.data)?;
-            resolve_block(&mut nested, &else_block.data)?;
+            resolve_expr(&mut nested, condition, target)?;
+            resolve_block(&mut nested, then_block, target)?;
+            resolve_block(&mut nested, else_block, target)?;
         }
     };
-    Ok(())
+    expr.is_at(target, env)
 }
 
-pub fn resolve_block<'a>(env: &mut Env<'a>, block: &Block) -> Result<(), Error> {
+pub fn resolve_block<'a>(
+    env: &mut Env<'a>,
+    block: &Spanned<Block>,
+    target: Option<Span>,
+) -> Result<(), Error> {
+    resolve_raw_block(env, block, target)?;
+    block.is_at(target, env)
+}
+
+pub fn resolve_raw_block<'a>(
+    env: &mut Env<'a>,
+    block: &Block,
+    target: Option<Span>,
+) -> Result<(), Error> {
     let mut nested = env.push();
     for expr in &block.exprs {
-        resolve_expr(&mut nested, expr)?;
+        resolve_expr(&mut nested, expr, target)?;
     }
     if let Some(expr) = &block.value {
-        resolve_expr(&mut nested, expr)?;
+        resolve_expr(&mut nested, expr, target)?;
     }
     Ok(())
 }
 
-pub fn resolve_pattern<'a>(env: &mut Env<'a>, pattern: &Pattern) -> Result<(), Error> {
-    match pattern {
+pub fn resolve_pattern<'a>(
+    env: &mut Env<'a>,
+    pattern: &Spanned<Pattern>,
+    target: Option<Span>,
+) -> Result<(), Error> {
+    log!("{} {:?}", pattern.label(), pattern.span);
+    match &pattern.data {
         Pattern::Wildcard | Pattern::True | Pattern::False | Pattern::Integer(_) => {}
-
         Pattern::Identifier(ident) => env.bind(ident),
         Pattern::Path(path) => {
             env.find(path.top())?;
         }
-
         Pattern::Array { patterns } | Pattern::Tuple { patterns } => {
             for pat in patterns {
-                resolve_pattern(env, pat)?;
+                resolve_pattern(env, pat, target)?;
             }
         }
         Pattern::Constructor { name, patterns } => {
             env.find(name.top())?;
             for pat in patterns {
-                resolve_pattern(env, pat)?;
+                resolve_pattern(env, pat, target)?;
             }
         }
         Pattern::NamedConstructor { name, patterns } => {
@@ -152,19 +187,19 @@ pub fn resolve_pattern<'a>(env: &mut Env<'a>, pattern: &Pattern) -> Result<(), E
                         env.bind(ident);
                     }
                     NamedPattern::Explicit { pattern, .. } => {
-                        resolve_pattern(env, pattern)?;
+                        resolve_pattern(env, pattern, target)?;
                     }
                 }
             }
         }
-        Pattern::Alternatives { patterns } => todo!(),
+        Pattern::Alternatives { patterns } => log!("TODO: Alternatives"),
         Pattern::MatchArms { arms } => {
             for (pat, block) in arms {
                 let mut nested = env.push();
-                resolve_pattern(&mut nested, pat)?;
-                resolve_block(&mut nested, block)?;
+                resolve_pattern(&mut nested, pat, target)?;
+                resolve_block(&mut nested, block, target)?;
             }
         }
     }
-    Ok(())
+    pattern.is_at(target, env)
 }

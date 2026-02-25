@@ -1,4 +1,5 @@
 use std::io::{self, Stdout, Write};
+use std::sync::Mutex;
 
 use crossterm::{
     cursor,
@@ -12,8 +13,10 @@ use crossterm::{
 
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
 use crate::lexer::{self, Lexer, Token, TokenKind};
+use crate::log;
+use crate::logger::LOGGER;
 use crate::parser::{self, Parser};
-use crate::resolution::{Env, resolve_expr};
+use crate::resolution::{self, Env, resolve_expr};
 use crate::source::{Source, Span, Spanned};
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,7 @@ fn token_color(kind: TokenKind) -> Color {
 struct AstNode {
     label: &'static str,
     span: Span,
+    weak: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +130,7 @@ impl BasePane {
         let pos = source.index_to_position(self.cursor);
         format!(" {}:{} │ {}", pos.row + 1, pos.col + 1, source.len())
     }
-    fn on_key(&mut self, source: &mut Source, key: KeyEvent, rows: usize) {
+    fn on_key(&mut self, source: &Source, key: KeyEvent, rows: usize) {
         match key.code {
             KeyCode::Left => self.move_cursor_by(source, -1),
             KeyCode::Right => self.move_cursor_by(source, 1),
@@ -135,11 +139,9 @@ impl BasePane {
             KeyCode::Home => self.move_cursor_home(source),
             KeyCode::End => self.move_cursor_end(source),
             KeyCode::Enter => self.move_cursor_line(source, 1),
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
-            }
+            KeyCode::Backspace => self.move_cursor_line(source, -1),
+            KeyCode::PageUp => self.move_cursor_line(source, -20),
+            KeyCode::PageDown => self.move_cursor_line(source, 20),
             _ => {}
         }
         self.update_scroll(source, rows);
@@ -247,11 +249,19 @@ impl Pane for LogsPane {
         "Logs"
     }
     fn status(&self, ctx: &EditorContext) -> String {
-        self.0.status(&ctx.logs)
+        self.0.status(&LOGGER.lock().unwrap())
     }
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
         let rows = ctx.content_rows() as usize;
-        self.0.on_key(&mut ctx.logs, key, rows);
+        if key.code == KeyCode::Enter {
+            LOGGER.lock().unwrap().append("\n");
+        }
+        self.0.on_key(&mut LOGGER.lock().unwrap(), key, rows);
+    }
+    fn on_focus(&mut self, ctx: &mut EditorContext) {
+        let source = LOGGER.lock().unwrap();
+        self.0.cursor = source.len();
+        self.0.update_scroll(&source, ctx.content_rows() as usize);
     }
     fn render(
         &self,
@@ -261,13 +271,15 @@ impl Pane for LogsPane {
         rows: usize,
         cols: usize,
     ) -> io::Result<()> {
-        self.0.render(&ctx.logs, stdout, top_y, rows, cols)
+        self.0
+            .render(&LOGGER.lock().unwrap(), stdout, top_y, rows, cols)
     }
 }
 
 struct TextPane {
     label: &'static str,
     base: BasePane,
+    version: u64,
     source: Source,
     generate: fn(&EditorContext) -> String,
 }
@@ -277,6 +289,7 @@ impl TextPane {
             label,
             base: BasePane::new(),
             source: Source::empty(String::new()),
+            version: 0,
             generate,
         }
     }
@@ -289,8 +302,11 @@ impl Pane for TextPane {
         self.base.status(&self.source)
     }
     fn on_focus(&mut self, ctx: &mut EditorContext) {
-        let s = (self.generate)(ctx);
-        self.source = Source::new(String::new(), &s);
+        if self.version < ctx.version {
+            let s = (self.generate)(ctx);
+            self.source = Source::new(String::new(), &s);
+            self.version = ctx.version;
+        }
     }
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
         let rows = ctx.content_rows() as usize;
@@ -312,9 +328,9 @@ impl Pane for TextPane {
 // Editor state
 // ---------------------------------------------------------------------------
 
-struct EditorContext {
-    source: Source,
-    logs: Source,
+pub struct EditorContext {
+    pub version: u64,
+    pub source: Source,
     output: CompilerOutput,
     ast_path: Vec<AstNode>,
     ast_cursor: Option<usize>,
@@ -322,7 +338,7 @@ struct EditorContext {
 }
 
 pub struct Editor {
-    ctx: EditorContext,
+    pub ctx: EditorContext,
     panes: Vec<Box<dyn Pane>>,
     active: usize,
 }
@@ -335,8 +351,8 @@ impl Editor {
     pub fn from_source(source: Source) -> Self {
         let term_size = terminal::size().unwrap_or((80, 24));
         let mut ctx = EditorContext {
+            version: 1,
             source,
-            logs: Source::empty("logs".into()),
             output: CompilerOutput {
                 errors: Vec::new(),
                 tokens: Vec::new(),
@@ -346,8 +362,11 @@ impl Editor {
             ast_path: Vec::new(),
             term_size,
         };
-        ctx.log("started");
+        log!("started");
         ctx.recompile();
+        if let ParserResult::Ast(ast) = &ctx.output.result {
+            ctx.ast_path = ast_path_at(ast, 0);
+        }
         Self {
             ctx,
             panes: vec![
@@ -362,12 +381,17 @@ impl Editor {
                         return "Parser failed — nothing to resolve.".into();
                     };
                     let mut env = Env::new();
+                    let target = ctx.last_strong().cloned();
+                    log!("{target:#?}");
+                    let target = target.map(|node| node.span);
                     for expr in exprs {
-                        if let Err(error) = resolve_expr(&mut env, expr) {
-                            return format!("Resolution failed: {error:?}");
+                        match resolve_expr(&mut env, expr, target) {
+                            Ok(()) => {}
+                            Err(resolution::Error::Reached) => return format!("{env:#?}"),
+                            Err(error) => return format!("Resolution failed: {error:?}"),
                         }
                     }
-                    "Resolution succeeded.".into()
+                    format!("{env:#?}")
                 })),
             ],
             active: 0,
@@ -381,6 +405,7 @@ impl Editor {
     pub fn run(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
         terminal::enable_raw_mode()?;
+        install_panic_hook();
         execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
         self.render(&mut stdout)?;
@@ -400,8 +425,13 @@ impl Editor {
             self.render(&mut stdout)?;
         }
 
+        Self::cleanup(&mut stdout)
+    }
+
+    fn cleanup(stdout: &mut Stdout) -> io::Result<()> {
         execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
         terminal::disable_raw_mode()?;
+        stdout.flush()?;
         Ok(())
     }
 
@@ -509,19 +539,13 @@ impl Editor {
 }
 
 impl EditorContext {
-    fn log(&mut self, message: &str) {
-        let now = time::OffsetDateTime::now_utc();
-        self.logs.append(format!(
-            "[{:02}:{:02}:{:02}] {message}\n",
-            now.hour(),
-            now.minute(),
-            now.second()
-        ));
-    }
-
     // -----------------------------------------------------------------------
     // AST navigation
     // -----------------------------------------------------------------------
+
+    fn last_strong(&self) -> Option<&AstNode> {
+        self.ast_path.iter().rev().find(|node| !node.weak)
+    }
 
     fn ast_navigate_up(&mut self) {
         let len = self.ast_path.len();
@@ -696,11 +720,10 @@ impl Pane for EditorPane {
         format!(" {} │ {} │ {} │ {} ", loc, token_info, ast_info, ok)
     }
 
-    fn on_focus(&mut self, ctx: &mut EditorContext) {
-        ctx.log("editor focus");
-    }
-
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
+        let rows = ctx.content_rows() as usize;
+
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -726,7 +749,7 @@ impl Pane for EditorPane {
                     } else {
                         self.move_node_left(ctx);
                     }
-                } else if ctrl {
+                } else if ctrl || shift {
                     self.move_token_left(ctx);
                 } else {
                     self.move_cursor_by(&ctx.source, -1);
@@ -739,17 +762,20 @@ impl Pane for EditorPane {
                     } else {
                         self.move_node_right(ctx);
                     }
-                } else if ctrl {
+                } else if ctrl || shift {
                     self.move_token_right(ctx);
                 } else {
                     self.move_cursor_by(&ctx.source, 1);
                 }
             }
-            KeyCode::Up => self.move_cursor_line(&ctx.source, -1),
-            KeyCode::Down => self.move_cursor_line(&ctx.source, 1),
-            KeyCode::Home => self.move_cursor_home(&ctx.source),
-            KeyCode::End => self.move_cursor_end(&ctx.source),
 
+            KeyCode::Tab => {
+                for i in 0..4 {
+                    ctx.source.insert(self.cursor, ' ');
+                    self.cursor += 1;
+                }
+                ctx.recompile();
+            }
             KeyCode::Char(c) => {
                 ctx.source.insert(self.cursor, c);
                 self.cursor += 1;
@@ -766,8 +792,17 @@ impl Pane for EditorPane {
                     ctx.source.remove_span(span);
                     self.cursor = span.start;
                 } else if self.cursor > 0 {
-                    self.cursor -= 1;
-                    ctx.source.remove(self.cursor);
+                    if ctrl || shift {
+                        let end = self.cursor;
+                        self.move_token_left(ctx);
+                        ctx.source.remove_span(Span {
+                            start: self.cursor,
+                            end,
+                        })
+                    } else {
+                        self.cursor -= 1;
+                        ctx.source.remove(self.cursor);
+                    }
                 }
                 ctx.recompile();
             }
@@ -781,14 +816,15 @@ impl Pane for EditorPane {
                 }
                 ctx.recompile();
             }
-            _ => {}
+            _ => self.0.on_key(&mut ctx.source, key, rows),
         }
 
+        ctx.version += 1;
         ctx.ast_cursor = None;
         if let ParserResult::Ast(ast) = &ctx.output.result {
             ctx.ast_path = ast_path_at(ast, self.cursor);
         }
-        self.update_scroll(&ctx.source, ctx.content_rows() as usize);
+        self.update_scroll(&ctx.source, rows);
     }
 
     fn render(
@@ -1070,6 +1106,7 @@ fn visit_constructor_name(name: &Spanned<Path>, path: &mut Vec<AstNode>) {
     path.push(AstNode {
         label: "ConstructorName",
         span: name.span,
+        weak: true,
     });
 }
 
@@ -1077,10 +1114,11 @@ fn visit_block(block: &Spanned<Block>, cursor: usize, path: &mut Vec<AstNode>) {
     path.push(AstNode {
         label: "Block",
         span: block.span,
+        weak: false,
     });
-    visit_block_raw(&block.data, cursor, path)
+    visit_raw_block(&block.data, cursor, path)
 }
-fn visit_block_raw(block: &Block, cursor: usize, path: &mut Vec<AstNode>) {
+fn visit_raw_block(block: &Block, cursor: usize, path: &mut Vec<AstNode>) {
     for expr in &block.exprs {
         if expr.contains(cursor) {
             visit_expr(expr, cursor, path);
@@ -1096,11 +1134,12 @@ fn visit_block_raw(block: &Block, cursor: usize, path: &mut Vec<AstNode>) {
 
 fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
     path.push(AstNode {
-        label: expr_label(&expr.data),
+        label: expr.label(),
         span: expr.span,
+        weak: false,
     });
     match &expr.data {
-        Expr::Block(block) => visit_block_raw(block, cursor, path),
+        Expr::Block(block) => visit_raw_block(block, cursor, path),
         Expr::Binding { expr, pattern } => {
             if expr.contains(cursor) {
                 visit_expr(expr, cursor, path);
@@ -1171,6 +1210,7 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
                     path.push(AstNode {
                         label: "NamedArg",
                         span: arg.span,
+                        weak: true,
                     });
                     if let NamedExpr::Explicit { expr, .. } = &arg.data {
                         visit_expr(expr, cursor, path);
@@ -1185,8 +1225,9 @@ fn visit_expr(expr: &Spanned<Expr>, cursor: usize, path: &mut Vec<AstNode>) {
 
 fn visit_pattern(pattern: &Spanned<Pattern>, cursor: usize, path: &mut Vec<AstNode>) {
     path.push(AstNode {
-        label: pattern_label(&pattern.data),
+        label: pattern.label(),
         span: pattern.span,
+        weak: false,
     });
     match &pattern.data {
         Pattern::Alternatives { patterns }
@@ -1221,6 +1262,7 @@ fn visit_pattern(pattern: &Spanned<Pattern>, cursor: usize, path: &mut Vec<AstNo
                     path.push(AstNode {
                         label: "NamedFieldPat",
                         span: pat.span,
+                        weak: true,
                     });
                     if let NamedPattern::Explicit { pattern: inner, .. } = &pat.data {
                         if inner.contains(cursor) {
@@ -1238,6 +1280,7 @@ fn visit_pattern(pattern: &Spanned<Pattern>, cursor: usize, path: &mut Vec<AstNo
                     path.push(AstNode {
                         label: "MatchArm",
                         span,
+                        weak: true,
                     });
                 }
                 if pat.contains(cursor) {
@@ -1256,46 +1299,6 @@ fn visit_pattern(pattern: &Spanned<Pattern>, cursor: usize, path: &mut Vec<AstNo
         | Pattern::Integer(_)
         | Pattern::Identifier(_)
         | Pattern::Path(_) => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Labels
-// ---------------------------------------------------------------------------
-
-fn expr_label(expr: &Expr) -> &'static str {
-    match expr {
-        Expr::True => "True",
-        Expr::False => "False",
-        Expr::Integer(_) => "Integer",
-        Expr::Identifier(_) => "Identifier",
-        Expr::Path(_) => "Path",
-        Expr::Block(_) => "Block",
-        Expr::Array { .. } => "Array",
-        Expr::Tuple { .. } => "Tuple",
-        Expr::Constructor { .. } => "Constructor",
-        Expr::NamedConstructor { .. } => "NamedConstructor",
-        Expr::Binding { .. } => "Binding",
-        Expr::ThenFlow { .. } => "ThenFlow",
-        Expr::ElseFlow { .. } => "ElseFlow",
-        Expr::ThenElseFlow { .. } => "ThenElseFlow",
-    }
-}
-
-fn pattern_label(pat: &Pattern) -> &'static str {
-    match pat {
-        Pattern::Wildcard => "Wildcard",
-        Pattern::True => "TruePat",
-        Pattern::False => "FalsePat",
-        Pattern::Integer(_) => "IntegerPat",
-        Pattern::Identifier(_) => "IdentifierPat",
-        Pattern::Path(_) => "PathPat",
-        Pattern::Array { .. } => "ArrayPat",
-        Pattern::Tuple { .. } => "TuplePat",
-        Pattern::Constructor { .. } => "ConstructorPat",
-        Pattern::NamedConstructor { .. } => "NamedConstructorPat",
-        Pattern::Alternatives { .. } => "Alternatives",
-        Pattern::MatchArms { .. } => "MatchArms",
     }
 }
 
@@ -1345,4 +1348,37 @@ fn pad(s: &str, width: usize) -> String {
     } else {
         format!("{:<width$}", s, width = width)
     }
+}
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        let mut stdout = io::stdout();
+        let _ = Editor::cleanup(&mut stdout);
+
+        eprintln!("\n========== PANIC ==========");
+        if let Some(location) = panic_info.location() {
+            eprintln!(
+                "Panic occurred in file '{}' at line {}",
+                location.file(),
+                location.line()
+            );
+        }
+        if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
+            eprintln!("Message: {}", message);
+        } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
+            eprintln!("Message: {}", message);
+        }
+
+        eprintln!("\n========== LOG DUMP ==========");
+        match LOGGER.lock() {
+            Ok(logger) => {
+                eprintln!("{}", logger.buffer.iter().collect::<String>());
+            }
+            Err(_) => {
+                eprintln!("Logger mutex was poisoned!");
+            }
+        }
+
+        eprintln!("=============================\n");
+    }));
 }

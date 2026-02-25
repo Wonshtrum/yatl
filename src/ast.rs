@@ -133,6 +133,54 @@ pub enum Pattern {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Labels
+// ---------------------------------------------------------------------------
+
+impl Expr {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::True => "True",
+            Self::False => "False",
+            Self::Integer(_) => "Integer",
+            Self::Identifier(_) => "Identifier",
+            Self::Path(_) => "Path",
+            Self::Block(_) => "Block",
+            Self::Array { .. } => "Array",
+            Self::Tuple { .. } => "Tuple",
+            Self::Constructor { .. } => "Constructor",
+            Self::NamedConstructor { .. } => "NamedConstructor",
+            Self::Binding { .. } => "Binding",
+            Self::ThenFlow { .. } => "ThenFlow",
+            Self::ElseFlow { .. } => "ElseFlow",
+            Self::ThenElseFlow { .. } => "ThenElseFlow",
+        }
+    }
+}
+
+impl Pattern {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Wildcard => "Wildcard",
+            Self::True => "TruePat",
+            Self::False => "FalsePat",
+            Self::Integer(_) => "IntegerPat",
+            Self::Identifier(_) => "IdentifierPat",
+            Self::Path(_) => "PathPat",
+            Self::Array { .. } => "ArrayPat",
+            Self::Tuple { .. } => "TuplePat",
+            Self::Constructor { .. } => "ConstructorPat",
+            Self::NamedConstructor { .. } => "NamedConstructorPat",
+            Self::Alternatives { .. } => "Alternatives",
+            Self::MatchArms { .. } => "MatchArms",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slightly more compact Debug
+// ---------------------------------------------------------------------------
+
 impl fmt::Debug for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Path(\"")?;

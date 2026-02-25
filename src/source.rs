@@ -14,7 +14,7 @@ impl Span {
         }
     }
 
-    pub fn attach<T: Clone>(self, data: T) -> Spanned<T> {
+    pub fn attach<T>(self, data: T) -> Spanned<T> {
         Spanned { data, span: self }
     }
 
@@ -27,25 +27,33 @@ impl Span {
     }
 }
 
-#[derive(Clone)]
-pub struct Spanned<T: Clone> {
+pub struct Spanned<T> {
     pub data: T,
     pub span: Span,
 }
 
-impl<T: fmt::Debug + Clone> fmt::Debug for Spanned<T> {
+impl<T: Clone> Clone for Spanned<T> {
+    fn clone(&self) -> Spanned<T> {
+        Self {
+            data: self.data.clone(),
+            span: self.span.clone(),
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Spanned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.data.fmt(f)
     }
 }
 
-impl<T: fmt::Debug + Clone> Spanned<T> {
+impl<T> Spanned<T> {
     pub fn contains(&self, pos: usize) -> bool {
         self.span.contains(pos)
     }
 }
 
-impl<T: fmt::Debug + Clone> std::ops::Deref for Spanned<T> {
+impl<T> std::ops::Deref for Spanned<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.data
@@ -85,7 +93,7 @@ impl Source {
         source
     }
 
-    pub fn empty(name: String) -> Self {
+    pub const fn empty(name: String) -> Self {
         Self {
             name,
             buffer: Vec::new(),
@@ -111,7 +119,7 @@ impl Source {
         self.rebuild_nl_map();
     }
 
-    pub fn append(&mut self, chunk: String) {
+    pub fn append(&mut self, chunk: &str) {
         let nl_map = chunk
             .chars()
             .enumerate()
@@ -183,6 +191,10 @@ impl Source {
             .iter()
             .copied()
             .collect()
+    }
+
+    pub fn content(&self) -> String {
+        self.buffer.iter().copied().collect()
     }
 
     // -----------------------------------------------------------------------
