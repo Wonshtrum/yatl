@@ -9,14 +9,14 @@ mod resolution;
 mod source;
 
 fn main() {
-    let args = std::env::args();
+    let mut args = std::env::args();
     if args.len() > 2 {
         panic!("too many arguments");
     }
 
-    let path = args.skip(1).next();
+    let path = args.nth(1);
     let source = if let Some(path) = &path {
-        let mut file = std::fs::File::open(&path).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
         let mut content = String::new();
         file.read_to_string(&mut content).unwrap();
         source::Source::new(path.clone(), &content)

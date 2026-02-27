@@ -1,5 +1,4 @@
 use std::io::{self, Stdout, Write};
-use std::sync::Mutex;
 
 use crossterm::{
     cursor,
@@ -198,7 +197,7 @@ impl BasePane {
                 .iter()
                 .take(text_cols)
                 .collect();
-            let padded = format!("{:<width$}", text, width = text_cols);
+            let padded = format!("{text:<text_cols$}");
 
             queue!(
                 stdout,
@@ -248,7 +247,7 @@ impl Pane for LogsPane {
     fn label(&self) -> &str {
         "Logs"
     }
-    fn status(&self, ctx: &EditorContext) -> String {
+    fn status(&self, _ctx: &EditorContext) -> String {
         self.0.status(&LOGGER.lock().unwrap())
     }
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
@@ -256,7 +255,7 @@ impl Pane for LogsPane {
         if key.code == KeyCode::Enter {
             LOGGER.lock().unwrap().append("\n");
         }
-        self.0.on_key(&mut LOGGER.lock().unwrap(), key, rows);
+        self.0.on_key(&LOGGER.lock().unwrap(), key, rows);
     }
     fn on_focus(&mut self, ctx: &mut EditorContext) {
         let source = LOGGER.lock().unwrap();
@@ -265,7 +264,7 @@ impl Pane for LogsPane {
     }
     fn render(
         &self,
-        ctx: &EditorContext,
+        _ctx: &EditorContext,
         stdout: &mut Stdout,
         top_y: u16,
         rows: usize,
@@ -296,7 +295,7 @@ impl TextPane {
 }
 impl Pane for TextPane {
     fn label(&self) -> &str {
-        &self.label
+        self.label
     }
     fn status(&self, _ctx: &EditorContext) -> String {
         self.base.status(&self.source)
@@ -310,7 +309,7 @@ impl Pane for TextPane {
     }
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
         let rows = ctx.content_rows() as usize;
-        self.base.on_key(&mut self.source, key, rows);
+        self.base.on_key(&self.source, key, rows);
     }
     fn render(
         &self,
@@ -717,7 +716,7 @@ impl Pane for EditorPane {
         } else {
             ""
         };
-        format!(" {} │ {} │ {} │ {} ", loc, token_info, ast_info, ok)
+        format!(" {loc} │ {token_info} │ {ast_info} │ {ok} ")
     }
 
     fn on_key(&mut self, ctx: &mut EditorContext, key: KeyEvent) {
@@ -770,7 +769,7 @@ impl Pane for EditorPane {
             }
 
             KeyCode::Tab => {
-                for i in 0..4 {
+                for _ in 0..4 {
                     ctx.source.insert(self.cursor, ' ');
                     self.cursor += 1;
                 }
@@ -816,7 +815,7 @@ impl Pane for EditorPane {
                 }
                 ctx.recompile();
             }
-            _ => self.0.on_key(&mut ctx.source, key, rows),
+            _ => self.0.on_key(&ctx.source, key, rows),
         }
 
         ctx.version += 1;
@@ -1346,7 +1345,7 @@ fn pad(s: &str, width: usize) -> String {
     if count >= width {
         s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
     } else {
-        format!("{:<width$}", s, width = width)
+        format!("{s:<width$}")
     }
 }
 

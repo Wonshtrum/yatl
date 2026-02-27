@@ -1,9 +1,15 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
+}
+
+impl fmt::Debug for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Span[{}, {}]", self.start, self.end)
+    }
 }
 
 impl Span {
@@ -36,7 +42,7 @@ impl<T: Clone> Clone for Spanned<T> {
     fn clone(&self) -> Spanned<T> {
         Self {
             data: self.data.clone(),
-            span: self.span.clone(),
+            span: self.span,
         }
     }
 }
@@ -135,7 +141,7 @@ impl Source {
     }
 
     pub fn remove_span(&mut self, span: Span) {
-        self.buffer.drain(span.start as usize..span.end as usize);
+        self.buffer.drain(span.start..span.end);
         self.rebuild_nl_map();
     }
 
