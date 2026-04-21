@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 
 mod ast;
 mod editor;
+mod interpreter;
 mod lexer;
 mod logger;
 mod parser;

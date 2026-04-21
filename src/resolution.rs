@@ -27,10 +27,24 @@ pub struct Env {
     id: u32,
     sealed: bool,
     scopes: Vec<HashMap<String, u32>>,
-    symbols: HashMap<Span, u32>,
+    pub symbols: HashMap<Span, u32>,
 }
 
 impl Env {
+    pub fn with_symbols(env: &[&str]) -> Self {
+        let mut id = 0;
+        let mut scope = HashMap::new();
+        for &symbol in env {
+            id += 1;
+            scope.insert(symbol.to_owned(), id);
+        }
+        Self {
+            id,
+            sealed: false,
+            scopes: vec![scope, HashMap::new()],
+            symbols: HashMap::new(),
+        }
+    }
     pub fn new() -> Self {
         Self {
             id: 0,
@@ -111,17 +125,17 @@ pub fn resolve_expr(
             }
         }
         Expr::Constructor { name, args } => {
-            env.find(name.top(), span)?;
+            env.find(name.top(), name.span)?;
             for arg in args {
                 resolve_expr(env, arg, target)?;
             }
         }
         Expr::NamedConstructor { name, args } => {
-            env.find(name.top(), span)?;
+            env.find(name.top(), name.span)?;
             for arg in args {
                 match &arg.data {
                     NamedExpr::Implicit(ident) => {
-                        env.find(ident, span)?;
+                        env.find(ident, arg.span)?;
                     }
                     NamedExpr::Explicit { expr, .. } => {
                         resolve_expr(env, expr, target)?;
@@ -201,17 +215,17 @@ pub fn resolve_pattern(
             }
         }
         Pattern::Constructor { name, patterns } => {
-            env.find(name.top(), span)?;
+            env.find(name.top(), name.span)?;
             for pat in patterns {
                 resolve_pattern(env, pat, target)?;
             }
         }
         Pattern::NamedConstructor { name, patterns } => {
-            env.find(name.top(), span)?;
+            env.find(name.top(), name.span)?;
             for pat in patterns {
                 match &pat.data {
                     NamedPattern::Implicit(ident) => {
-                        env.bind(ident, span);
+                        env.bind(ident, pat.span);
                     }
                     NamedPattern::Explicit { pattern, .. } => {
                         resolve_pattern(env, pattern, target)?;

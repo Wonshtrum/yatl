@@ -17,6 +17,7 @@ use crate::logger::LOGGER;
 use crate::parser::{self, Parser};
 use crate::resolution::{self, Env, resolve_expr};
 use crate::source::{Source, Span, Spanned};
+use crate::interpreter::run;
 
 // ---------------------------------------------------------------------------
 // Token foreground color
@@ -379,7 +380,9 @@ impl Editor {
                     let ParserResult::Ast(exprs) = &ctx.output.result else {
                         return "Parser failed — nothing to resolve.".into();
                     };
-                    let mut env = Env::new();
+                    let mut env = Env::with_symbols(&[
+                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
+                    ]);
                     let target = ctx.last_strong().cloned();
                     log!("{target:#?}");
                     let target = target.map(|node| node.span);
@@ -392,6 +395,25 @@ impl Editor {
                     }
                     format!("{env:#?}")
                 })),
+                Box::new(TextPane::new("Exec", |ctx| {
+                    let ParserResult::Ast(exprs) = &ctx.output.result else {
+                        return "Parser failed — nothing to resolve.".into();
+                    };
+                    let mut env = Env::with_symbols(&[
+                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
+                    ]);
+                    for expr in exprs {
+                        match resolve_expr(&mut env, expr, None) {
+                            Ok(()) => {}
+                            Err(resolution::Error::Reached) => unreachable!(),
+                            Err(error) => return format!("Resolution failed: {error:?}"),
+                        }
+                    }
+                    let result = run(&[
+                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
+                    ], env.symbols, exprs);
+                    format!("{result:#?}")
+                }))
             ],
             active: 0,
         }
