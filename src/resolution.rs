@@ -1,13 +1,36 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Pattern};
 use crate::log;
-use crate::source::{Span, Spanned};
+use crate::source::{Source, Span, Spanned};
 
 #[derive(Debug)]
 pub enum Error {
     Reached,
     NotInScope { ident: String, span: Span },
+    AlreadyInPattern { ident: String, old: Span, new: Span },
+}
+impl Error {
+    pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
+        match self {
+            Error::Reached => out.write_str("reached"),
+            Error::NotInScope { ident, span } => {
+                out.write_fmt(format_args!(
+                    "error: Identifier `{ident}` not found in scope\n"
+                ))?;
+                source.print_span(*span, out)
+            }
+            Error::AlreadyInPattern { ident, old, new } => {
+                out.write_fmt(format_args!(
+                    "error: Identifier `{ident}` bound more than once in same pattern\n"
+                ))?;
+                source.print_span(*new, out)?;
+                out.write_str("note: First bound here\n")?;
+                source.print_span(*old, out)
+            }
+        }
+    }
 }
 
 impl<T> Spanned<T> {
@@ -57,13 +80,28 @@ impl Env {
         self.scopes.push(HashMap::new());
         Nested(self)
     }
-    pub fn bind(&mut self, ident: &str, span: Span) {
+    pub fn bind(&mut self, ident: &str, span: Span) -> Result<(), Error> {
         self.id += 1;
-        self.scopes
+        let old = self
+            .scopes
             .last_mut()
             .unwrap()
             .insert(ident.to_owned(), self.id);
+        if let Some(old) = old {
+            let new = span;
+            for (span, id) in &self.symbols {
+                if *id == old {
+                    return Err(Error::AlreadyInPattern {
+                        ident: ident.to_owned(),
+                        old: *span,
+                        new,
+                    });
+                }
+            }
+            unreachable!();
+        }
         self.symbols.insert(span, self.id);
+        Ok(())
     }
     pub fn find(&mut self, ident: &str, span: Span) -> Result<u32, Error> {
         for scope in self.scopes.iter().rev() {
@@ -98,6 +136,17 @@ impl<'a> std::ops::Drop for Nested<'a> {
             self.scopes.pop().unwrap();
         }
     }
+}
+
+pub fn resolve_exprs(
+    env: &mut Env,
+    exprs: &[Spanned<Expr>],
+    target: Option<Span>,
+) -> Result<(), Error> {
+    for expr in exprs {
+        resolve_expr(env, expr, target)?
+    }
+    Ok(())
 }
 
 pub fn resolve_expr(
@@ -205,7 +254,7 @@ pub fn resolve_pattern(
     log!("{} {span:?}", pattern.label());
     match &pattern.data {
         Pattern::Wildcard | Pattern::True | Pattern::False | Pattern::Integer(_) => {}
-        Pattern::Identifier(ident) => env.bind(ident, span),
+        Pattern::Identifier(ident) => env.bind(ident, span)?,
         Pattern::Path(path) => {
             env.find(path.top(), span)?;
         }
@@ -225,7 +274,7 @@ pub fn resolve_pattern(
             for pat in patterns {
                 match &pat.data {
                     NamedPattern::Implicit(ident) => {
-                        env.bind(ident, pat.span);
+                        env.bind(ident, pat.span)?;
                     }
                     NamedPattern::Explicit { pattern, .. } => {
                         resolve_pattern(env, pattern, target)?;

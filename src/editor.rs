@@ -11,13 +11,13 @@ use crossterm::{
 };
 
 use crate::ast::{Block, Expr, NamedExpr, NamedPattern, Path, Pattern};
+use crate::interpreter;
 use crate::lexer::{self, Lexer, Token, TokenKind};
 use crate::log;
 use crate::logger::LOGGER;
 use crate::parser::{self, Parser};
-use crate::resolution::{self, Env, resolve_expr};
+use crate::resolution::{self, Env, resolve_exprs};
 use crate::source::{Source, Span, Spanned};
-use crate::interpreter::run;
 
 // ---------------------------------------------------------------------------
 // Token foreground color
@@ -77,15 +77,29 @@ struct AstNode {
 // Compiler output
 // ---------------------------------------------------------------------------
 
-enum ParserResult {
-    Ast(Vec<Spanned<Expr>>),
-    Error(String),
-}
-
+#[rustfmt::skip]
 struct CompilerOutput {
-    tokens: Vec<Spanned<Token>>,
     errors: Vec<Diagnostic>,
-    result: ParserResult,
+    result:
+        Result<(
+            Vec<Spanned<Token>>,
+            Result<(
+                Vec<Spanned<Expr>>,
+                Result<
+                    Env,
+                    String>,
+                ),
+                String>,
+            ),
+            String>,
+}
+impl CompilerOutput {
+    fn tokens(&self) -> &[Spanned<Token>] {
+        match &self.result {
+            Ok((tokens, _)) => tokens,
+            _ => &[],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -355,8 +369,7 @@ impl Editor {
             source,
             output: CompilerOutput {
                 errors: Vec::new(),
-                tokens: Vec::new(),
-                result: ParserResult::Error("".into()),
+                result: Err("".into()),
             },
             ast_cursor: None,
             ast_path: Vec::new(),
@@ -364,7 +377,7 @@ impl Editor {
         };
         log!("started");
         ctx.recompile();
-        if let ParserResult::Ast(ast) = &ctx.output.result {
+        if let Ok((_token, Ok((ast, _)))) = &ctx.output.result {
             ctx.ast_path = ast_path_at(ast, 0);
         }
         Self {
@@ -373,47 +386,52 @@ impl Editor {
                 Box::new(EditorPane::new()),
                 Box::new(LogsPane::new()),
                 Box::new(TextPane::new("Parser", |ctx| match &ctx.output.result {
-                    ParserResult::Ast(exprs) => format!("{exprs:#?}"),
-                    ParserResult::Error(error) => error.clone(),
+                    Err(error) | Ok((_, Err(error))) => error.clone(),
+                    Ok((_token, Ok((ast, _)))) => format!("{ast:#?}"),
                 })),
                 Box::new(TextPane::new("Resolution", |ctx| {
-                    let ParserResult::Ast(exprs) = &ctx.output.result else {
-                        return "Parser failed — nothing to resolve.".into();
+                    let exprs = match &ctx.output.result {
+                        Err(_) => {
+                            return "Lexer failed — nothing to resolve.".into();
+                        }
+                        Ok((_, Err(_))) => {
+                            return "Parser failed — nothing to resolve.".into();
+                        }
+                        Ok((_, Ok((ast, _)))) => ast,
                     };
-                    let mut env = Env::with_symbols(&[
-                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
-                    ]);
                     let target = ctx.last_strong().cloned();
                     log!("{target:#?}");
                     let target = target.map(|node| node.span);
-                    for expr in exprs {
-                        match resolve_expr(&mut env, expr, target) {
-                            Ok(()) => {}
-                            Err(resolution::Error::Reached) => return format!("{env:#?}"),
-                            Err(error) => return format!("Resolution failed: {error:?}"),
+                    let mut env = Env::with_symbols(&interpreter::default_symbols());
+                    match resolve_exprs(&mut env, exprs, target) {
+                        Ok(()) | Err(resolution::Error::Reached) => format!("{env:#?}"),
+                        Err(error) => {
+                            let mut out = String::new();
+                            let _ = error.pretty_print(&ctx.source, &mut out);
+                            out
                         }
                     }
-                    format!("{env:#?}")
                 })),
                 Box::new(TextPane::new("Exec", |ctx| {
-                    let ParserResult::Ast(exprs) = &ctx.output.result else {
-                        return "Parser failed — nothing to resolve.".into();
-                    };
-                    let mut env = Env::with_symbols(&[
-                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
-                    ]);
-                    for expr in exprs {
-                        match resolve_expr(&mut env, expr, None) {
-                            Ok(()) => {}
-                            Err(resolution::Error::Reached) => unreachable!(),
-                            Err(error) => return format!("Resolution failed: {error:?}"),
+                    let (exprs, env) = match &ctx.output.result {
+                        Err(_) => {
+                            return "Lexer failed — nothing to execute.".into();
                         }
-                    }
-                    let result = run(&[
-                        "Option", "Some", "None", "Result", "Ok", "Err", "print",
-                    ], env.symbols, exprs);
+                        Ok((_, Err(_))) => {
+                            return "Parser failed — nothing to execute.".into();
+                        }
+                        Ok((_, Ok((_, Err(_))))) => {
+                            return "Resolution failed — nothing to execute.".into();
+                        }
+                        Ok((_, Ok((ast, Ok(env))))) => (ast, env),
+                    };
+                    let result = interpreter::run(
+                        &interpreter::default_functions(),
+                        env.symbols.clone(),
+                        exprs,
+                    );
                     format!("{result:#?}")
-                }))
+                })),
             ],
             active: 0,
         }
@@ -600,31 +618,50 @@ impl EditorContext {
                 let (span, message) = lex_error_info(&error);
                 let mut out = String::new();
                 let _ = error.pretty_print(&self.source, &mut out);
+                errors.push(Diagnostic { span, message });
                 self.output = CompilerOutput {
-                    tokens: Vec::new(),
-                    errors: vec![Diagnostic { span, message }],
-                    result: ParserResult::Error(out),
+                    errors,
+                    result: Err(out),
                 };
                 return;
             }
         };
 
         let mut parser = Parser::new(&self.source, tokens.clone());
-        let result = match parser.parse() {
-            Ok(exprs) => ParserResult::Ast(exprs),
+        let ast = match parser.parse() {
+            Ok(exprs) => exprs,
             Err(error) => {
                 let (span, message) = parser_error_info(&error);
                 let mut out = String::new();
                 let _ = error.pretty_print(&self.source, &mut out);
                 errors.push(Diagnostic { span, message });
-                ParserResult::Error(out)
+                self.output = CompilerOutput {
+                    errors,
+                    result: Ok((tokens, Err(out))),
+                };
+                return;
+            }
+        };
+
+        let mut env = Env::with_symbols(&interpreter::default_symbols());
+        match resolution::resolve_exprs(&mut env, &ast, None) {
+            Ok(()) => {}
+            Err(error) => {
+                let (span, message) = resolution_error_info(&error);
+                let mut out = String::new();
+                let _ = error.pretty_print(&self.source, &mut out);
+                errors.push(Diagnostic { span, message });
+                self.output = CompilerOutput {
+                    errors,
+                    result: Ok((tokens, Ok((ast, Err(out))))),
+                };
+                return;
             }
         };
 
         self.output = CompilerOutput {
-            tokens,
             errors,
-            result,
+            result: Ok((tokens, Ok((ast, Ok(env))))),
         };
     }
 
@@ -708,7 +745,7 @@ impl Pane for EditorPane {
         let loc = format!("{}:{}", pos.row + 1, pos.col + 1);
 
         let token_info = {
-            let tokens = &ctx.output.tokens;
+            let tokens = ctx.output.tokens();
             let idx = tokens.partition_point(|tok| tok.span.end <= self.cursor);
             tokens
                 .get(idx)
@@ -842,8 +879,9 @@ impl Pane for EditorPane {
 
         ctx.version += 1;
         ctx.ast_cursor = None;
-        if let ParserResult::Ast(ast) = &ctx.output.result {
-            ctx.ast_path = ast_path_at(ast, self.cursor);
+        match &ctx.output.result {
+            Ok((_, Ok((ast, _)))) => ctx.ast_path = ast_path_at(ast, self.cursor),
+            _ => {}
         }
         self.update_scroll(&ctx.source, rows);
     }
@@ -927,7 +965,7 @@ impl EditorPane {
 
     fn move_token_left(&mut self, ctx: &EditorContext) {
         let pos = self.cursor;
-        let tokens = &ctx.output.tokens;
+        let tokens = ctx.output.tokens();
         let idx = tokens.partition_point(|tok| tok.span.start < pos);
         if let Some(tok) = tokens.get(idx.saturating_sub(1)) {
             self.cursor = if pos <= tok.span.start {
@@ -940,7 +978,7 @@ impl EditorPane {
 
     fn move_token_right(&mut self, ctx: &EditorContext) {
         let pos = self.cursor;
-        let tokens = &ctx.output.tokens;
+        let tokens = ctx.output.tokens();
         let idx = tokens.partition_point(|tok| tok.span.start <= pos);
         if let Some(tok) = tokens.get(idx) {
             self.cursor = tok.span.start;
@@ -960,7 +998,7 @@ impl EditorPane {
         max_cols: usize,
         highlight_span: Option<Span>,
     ) -> io::Result<()> {
-        let tokens = &ctx.output.tokens;
+        let tokens = &ctx.output.tokens();
         let mut col = 0usize;
         let mut offset = line_start;
         let mut tok_idx = tokens.partition_point(|tok| tok.span.end <= line_start);
@@ -1355,6 +1393,19 @@ fn parser_error_info(error: &parser::Error) -> (Span, String) {
             };
             (found.span, msg)
         }
+    }
+}
+
+fn resolution_error_info(error: &resolution::Error) -> (Span, String) {
+    match error {
+        resolution::Error::Reached => unreachable!(),
+        resolution::Error::NotInScope { ident, span } => {
+            (*span, format!("Identifier `{ident}` not found"))
+        }
+        resolution::Error::AlreadyInPattern { ident, new, .. } => (
+            *new,
+            format!("Identifier `{ident}` bound more than once in same pattern"),
+        ),
     }
 }
 
