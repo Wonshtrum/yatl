@@ -8,10 +8,11 @@ macro_rules! log {
     ($($arg:tt)*) => {{
         let now = ::time::OffsetDateTime::now_utc();
         let mut logger = $crate::logger::LOGGER.lock().unwrap();
-        logger.append(&format!("[{:02}:{:02}:{:02}] ",
+        logger.append(&format!("[{:02}:{:02}:{:02}] {}:{}: ",
             now.hour(),
             now.minute(),
             now.second(),
+            module_path!(), line!(),
         ));
         logger.append(&format!(
             $($arg)*

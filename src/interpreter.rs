@@ -1,8 +1,31 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::ast::{Block, Expr, Pattern};
 use crate::log;
-use crate::source::{Span, Spanned};
+use crate::source::{Source, Span, Spanned};
+
+#[derive(Debug)]
+pub enum Error {
+    Custom { message: String, span: Span },
+    Exit { span: Span },
+}
+impl Error {
+    pub fn pretty_print<W: fmt::Write>(&self, source: &Source, out: &mut W) -> fmt::Result {
+        match self {
+            Self::Exit { span } => {
+                out.write_str("exit")?;
+                out.write_char('\n')?;
+                source.print_span(*span, out)
+            }
+            Self::Custom { message, span } => {
+                out.write_str(message)?;
+                out.write_char('\n')?;
+                source.print_span(*span, out)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -33,26 +56,38 @@ struct Env {
 }
 
 impl Env {
-    fn get(&self, span: Span) -> Value {
+    fn get(&self, span: Span) -> Result<Value, Error> {
         let Some(id) = self.symbols.get(&span) else {
-            log!("env: {self:#?}");
-            log!("symbol: {span:?}");
-            panic!();
+            return Err(Error::Custom {
+                message: "bug: this was not parsed as an identifier".into(),
+                span,
+            });
         };
-        self.values.get(id).expect("value").clone()
+        let Some(val) = self.values.get(id) else {
+            return Err(Error::Custom {
+                message: "error: tried to use this variable before it was initialized".into(),
+                span,
+            });
+        };
+        Ok(val.clone())
     }
-    fn set(&mut self, span: Span, value: Value) {
+    fn set(&mut self, span: Span, value: Value) -> Result<(), Error> {
         let Some(id) = self.symbols.get(&span) else {
-            log!("env: {self:#?}");
-            log!("symbol: {span:?}");
-            panic!();
+            return Err(Error::Custom {
+                message: "error: tried to use this variable before it was initialized".into(),
+                span,
+            });
         };
         self.values.insert(*id, value);
+        Ok(())
     }
 }
 
 pub fn default_functions() -> Vec<&'static str> {
-    ["Option", "Some", "None", "Result", "Ok", "Err", "print"].into()
+    [
+        "Option", "Some", "None", "Result", "Ok", "Err", "print", "exit",
+    ]
+    .into()
 }
 pub fn default_symbols() -> Vec<&'static str> {
     default_functions()
@@ -62,7 +97,7 @@ pub fn run(
     functions: &[&'static str],
     symbols: HashMap<Span, u32>,
     exprs: &[Spanned<Expr>],
-) -> Value {
+) -> Result<Value, Error> {
     let mut env = Env {
         symbols,
         values: HashMap::new(),
@@ -70,60 +105,62 @@ pub fn run(
     for (i, name) in functions.iter().enumerate() {
         env.values.insert((i + 1) as u32, Value::Func(name));
     }
-    log!("{env:?}");
     let mut last = None;
     for expr in exprs {
-        let val = eval_expr(&mut env, expr);
+        let val = eval_expr(&mut env, expr)?;
         last = Some(val);
     }
-    last.unwrap_or(Value::Unit)
+    Ok(last.unwrap_or(Value::Unit))
 }
 
-fn eval_block(env: &mut Env, block: &Block) -> Value {
+fn eval_block(env: &mut Env, block: &Block) -> Result<Value, Error> {
     for expr in &block.exprs {
-        eval_expr(env, expr);
+        eval_expr(env, expr)?;
     }
     if let Some(value) = &block.value {
         eval_expr(env, value)
     } else {
-        Value::Unit
+        Ok(Value::Unit)
     }
 }
 
-fn eval_expr(env: &mut Env, expr: &Spanned<Expr>) -> Value {
+fn eval_expr(env: &mut Env, expr: &Spanned<Expr>) -> Result<Value, Error> {
     match &expr.data {
-        Expr::True => Value::True,
-        Expr::False => Value::False,
-        Expr::Integer(val) => Value::Integer(*val),
+        Expr::True => Ok(Value::True),
+        Expr::False => Ok(Value::False),
+        Expr::Integer(val) => Ok(Value::Integer(*val)),
         Expr::Identifier(_) => env.get(expr.span),
-        Expr::Path(_) => unimplemented!(),
+        Expr::Path(_) => Err(Error::Custom {
+            message: "unimplemented: path".into(),
+            span: expr.span,
+        }),
         Expr::Block(block) => eval_block(env, block),
-        Expr::Array { args } | Expr::Tuple { args } => {
-            let args = args
-                .iter()
-                .map(|arg| eval_expr(env, arg))
-                .collect::<Vec<_>>();
-            Value::List(args)
-        }
+        Expr::Array { args } | Expr::Tuple { args } => args
+            .iter()
+            .map(|arg| eval_expr(env, arg))
+            .collect::<Result<Vec<_>, Error>>()
+            .map(Value::List),
         Expr::Constructor { name, args } => {
             let args = args
                 .iter()
                 .map(|arg| eval_expr(env, arg))
-                .collect::<Vec<_>>();
-            match env.get(name.span) {
-                Value::Func("print") => {
-                    log!("CALL: {args:?}");
-                    Value::Unit
-                }
-                _ => panic!(),
+                .collect::<Result<Vec<_>, Error>>()?;
+            log!("CALL: {args:?}");
+            match env.get(name.span)? {
+                Value::Func("exit") => Err(Error::Exit { span: name.span }),
+                Value::Func("print") => Ok(Value::Unit),
+                _ => Err(Error::Custom {
+                    message: "unknown/unimplemented function".into(),
+                    span: name.span,
+                }),
             }
         }
         Expr::Binding { expr, pattern } => {
-            let val = eval_expr(env, expr);
-            if let Some(res) = try_bind(env, val, pattern) {
-                res
+            let val = eval_expr(env, expr)?;
+            if let Some(res) = try_bind(env, val, pattern)? {
+                Ok(res)
             } else {
-                Value::False
+                Ok(Value::False)
             }
             // if !bound {
             //     panic!("binding fail");
@@ -136,18 +173,18 @@ fn eval_expr(env: &mut Env, expr: &Spanned<Expr>) -> Value {
             condition,
             then_block,
         } => {
-            if eval_expr(env, condition).truthy() {
+            if eval_expr(env, condition)?.truthy() {
                 eval_block(env, then_block)
             } else {
-                Value::False
+                Ok(Value::False)
             }
         }
         Expr::ElseFlow {
             condition,
             else_block,
         } => {
-            if eval_expr(env, condition).truthy() {
-                Value::True
+            if eval_expr(env, condition)?.truthy() {
+                Ok(Value::True)
             } else {
                 eval_block(env, else_block)
             }
@@ -157,7 +194,7 @@ fn eval_expr(env: &mut Env, expr: &Spanned<Expr>) -> Value {
             then_block,
             else_block,
         } => {
-            if eval_expr(env, condition).truthy() {
+            if eval_expr(env, condition)?.truthy() {
                 eval_block(env, then_block)
             } else {
                 eval_block(env, else_block)
@@ -166,47 +203,53 @@ fn eval_expr(env: &mut Env, expr: &Spanned<Expr>) -> Value {
     }
 }
 
-fn try_bind(env: &mut Env, val: Value, pat: &Spanned<Pattern>) -> Option<Value> {
+fn try_bind(env: &mut Env, val: Value, pat: &Spanned<Pattern>) -> Result<Option<Value>, Error> {
     match (val, &pat.data) {
-        (_, Pattern::Wildcard) => Some(Value::Unit),
+        (_, Pattern::Wildcard) => Ok(Some(Value::Unit)),
         (val, Pattern::Identifier(_)) => {
-            env.set(pat.span, val);
-            Some(Value::Unit)
+            env.set(pat.span, val)?;
+            Ok(Some(Value::Unit))
         }
 
-        (Value::Unit, Pattern::Tuple { patterns }) if patterns.is_empty() => Some(Value::Unit),
-        (Value::True, Pattern::True) => Some(Value::Unit),
-        (Value::False, Pattern::False) => Some(Value::Unit),
-        (Value::Integer(val), Pattern::Integer(pat)) if val == *pat => Some(Value::Unit),
+        (Value::Unit, Pattern::Tuple { patterns }) if patterns.is_empty() => Ok(Some(Value::Unit)),
+        (Value::True, Pattern::True) => Ok(Some(Value::Unit)),
+        (Value::False, Pattern::False) => Ok(Some(Value::Unit)),
+        (Value::Integer(val), Pattern::Integer(pat)) if val == *pat => Ok(Some(Value::Unit)),
 
         (Value::List(values), Pattern::Array { patterns })
         | (Value::List(values), Pattern::Tuple { patterns })
             if values.len() == patterns.len() =>
         {
-            values
-                .into_iter()
-                .zip(patterns.iter())
-                .all(|(val, pat)| try_bind(env, val, pat).is_some())
-                .then_some(Value::Unit)
+            for (val, pat) in values.into_iter().zip(patterns.iter()) {
+                if try_bind(env, val, pat)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(Value::Unit))
+            // values
+            //     .into_iter()
+            //     .zip(patterns.iter())
+            //     .all(|(val, pat)| try_bind(env, val, pat).is_some())
+            //     .then_some(Value::Unit)
         }
 
         (val, Pattern::Alternatives { patterns }) => {
             for pat in patterns {
-                if try_bind(env, val.clone(), pat).is_some() {
-                    return Some(Value::Unit);
+                if try_bind(env, val.clone(), pat)?.is_some() {
+                    return Ok(Some(Value::Unit));
                 }
             }
-            None
+            Ok(None)
         }
         (val, Pattern::MatchArms { arms }) => {
             for (pat, expr) in arms {
-                if try_bind(env, val.clone(), pat).is_some() {
-                    return Some(eval_block(env, expr));
+                if try_bind(env, val.clone(), pat)?.is_some() {
+                    return eval_block(env, expr).map(Some);
                 }
             }
-            None
+            Ok(None)
         }
 
-        _ => None,
+        _ => Ok(None),
     }
 }

@@ -81,17 +81,11 @@ struct AstNode {
 struct CompilerOutput {
     errors: Vec<Diagnostic>,
     result:
-        Result<(
-            Vec<Spanned<Token>>,
-            Result<(
-                Vec<Spanned<Expr>>,
-                Result<
-                    Env,
-                    String>,
-                ),
-                String>,
-            ),
-            String>,
+        Result<(Vec<Spanned<Token>>,
+            Result<(Vec<Spanned<Expr>>,
+                Result<Env,String>),
+            String>),
+        String>,
 }
 impl CompilerOutput {
     fn tokens(&self) -> &[Spanned<Token>] {
@@ -399,9 +393,7 @@ impl Editor {
                         }
                         Ok((_, Ok((ast, _)))) => ast,
                     };
-                    let target = ctx.last_strong().cloned();
-                    log!("{target:#?}");
-                    let target = target.map(|node| node.span);
+                    let target = ctx.last_strong().map(|node| node.span);
                     let mut env = Env::with_symbols(&interpreter::default_symbols());
                     match resolve_exprs(&mut env, exprs, target) {
                         Ok(()) | Err(resolution::Error::Reached) => format!("{env:#?}"),
@@ -430,7 +422,14 @@ impl Editor {
                         env.symbols.clone(),
                         exprs,
                     );
-                    format!("{result:#?}")
+                    match result {
+                        Ok(value) => format!("{value:#?}"),
+                        Err(error) => {
+                            let mut out = String::new();
+                            let _ = error.pretty_print(&ctx.source, &mut out);
+                            out
+                        }
+                    }
                 })),
             ],
             active: 0,
@@ -1402,9 +1401,13 @@ fn resolution_error_info(error: &resolution::Error) -> (Span, String) {
         resolution::Error::NotInScope { ident, span } => {
             (*span, format!("Identifier `{ident}` not found"))
         }
-        resolution::Error::AlreadyInPattern { ident, new, .. } => (
+        resolution::Error::ShadowInPattern { ident, new, .. } => (
             *new,
             format!("Identifier `{ident}` bound more than once in same pattern"),
+        ),
+        resolution::Error::UnexpectedInAlternative { ident, span, .. } => (
+            *span,
+            format!("Identifier `{ident}` not bound in all alternatives"),
         ),
     }
 }
